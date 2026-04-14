@@ -1,0 +1,584 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AEM Assets — Create Folders &amp; Copy Assets</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #f4f6f9;
+      min-height: 100vh;
+      display: flex;
+      align-items: flex-start;
+      justify-content: center;
+      padding: 2rem;
+    }
+
+    .card {
+      background: #fff;
+      border-radius: 12px;
+      box-shadow: 0 4px 24px rgba(0,0,0,0.08);
+      width: 100%;
+      max-width: 600px;
+      overflow: hidden;
+    }
+
+    .card-header {
+      background: #1473e6;
+      padding: 1.5rem 2rem;
+    }
+
+    .card-header h1 { color: #fff; font-size: 1.2rem; font-weight: 600; }
+    .card-header p  { color: rgba(255,255,255,0.75); font-size: 0.82rem; margin-top: 0.3rem; }
+
+    .card-body { padding: 2rem; }
+
+    .section-title {
+      font-size: 0.72rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.07em;
+      color: #999;
+      margin-bottom: 1rem;
+    }
+
+    .field { margin-bottom: 1.2rem; }
+
+    label {
+      display: block;
+      font-size: 0.82rem;
+      font-weight: 600;
+      color: #2c2c2c;
+      margin-bottom: 0.4rem;
+    }
+
+    label .hint { font-weight: 400; color: #888; margin-left: 0.3rem; }
+
+    input, textarea {
+      width: 100%;
+      padding: 0.6rem 0.85rem;
+      border: 1.5px solid #d5d8dc;
+      border-radius: 6px;
+      font-size: 0.9rem;
+      color: #1a1a1a;
+      background: #fafafa;
+      transition: border-color 0.15s, box-shadow 0.15s;
+      outline: none;
+      font-family: inherit;
+    }
+
+    input:focus, textarea:focus {
+      border-color: #1473e6;
+      box-shadow: 0 0 0 3px rgba(20,115,230,0.12);
+      background: #fff;
+    }
+
+    input::placeholder, textarea::placeholder { color: #aaa; }
+    textarea { resize: vertical; min-height: 80px; line-height: 1.5; }
+
+    .divider { height: 1px; background: #eef0f3; margin: 1.5rem 0; }
+
+    .btn {
+      width: 100%;
+      padding: 0.75rem;
+      font-size: 0.95rem;
+      font-weight: 600;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: background 0.15s, transform 0.1s;
+      color: #fff;
+    }
+
+    .btn-primary          { background: #1473e6; }
+    .btn-primary:hover    { background: #0f5fc7; }
+    .btn-primary:active   { transform: scale(0.99); }
+    .btn-primary:disabled { background: #9bbce8; cursor: not-allowed; }
+
+    .spinner {
+      display: inline-block;
+      width: 14px; height: 14px;
+      border: 2px solid rgba(255,255,255,0.4);
+      border-top-color: #fff;
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+      vertical-align: middle;
+      margin-right: 0.4rem;
+    }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── Results list ── */
+    #results { margin-top: 1.5rem; display: none; }
+
+    .folder-row {
+      border: 1.5px solid #eef0f3;
+      border-radius: 8px;
+      margin-bottom: 0.75rem;
+      overflow: hidden;
+    }
+
+    .folder-row-header {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      padding: 0.65rem 1rem;
+      background: #fafbfc;
+      cursor: pointer;
+      user-select: none;
+    }
+
+    .folder-row-header:hover { background: #f0f4f9; }
+
+    .folder-name {
+      font-size: 0.88rem;
+      font-weight: 600;
+      color: #1a1a1a;
+      flex: 1;
+    }
+
+    .badge {
+      font-size: 0.72rem;
+      font-weight: 700;
+      padding: 0.2rem 0.55rem;
+      border-radius: 99px;
+      white-space: nowrap;
+    }
+
+    .badge-pending { background: #eef0f3; color: #777; }
+    .badge-running { background: #eaf3ff; color: #1473e6; }
+    .badge-ok      { background: #edfaf1; color: #2d9d5f; }
+    .badge-err     { background: #fff3f2; color: #d7373f; }
+    .badge-partial { background: #fff8e6; color: #c77b00; }
+
+    .chevron {
+      font-size: 0.7rem;
+      color: #aaa;
+      transition: transform 0.2s;
+    }
+
+    .folder-row.open .chevron { transform: rotate(90deg); }
+
+    .folder-row-body {
+      display: none;
+      padding: 0.75rem 1rem;
+      border-top: 1px solid #eef0f3;
+    }
+
+    .folder-row.open .folder-row-body { display: block; }
+
+    .step-line {
+      font-size: 0.8rem;
+      color: #555;
+      margin-bottom: 0.4rem;
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+    }
+
+    .step-dot {
+      width: 7px; height: 7px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+
+    .dot-ok      { background: #2d9d5f; }
+    .dot-err     { background: #d7373f; }
+    .dot-pending { background: #ccc; }
+    .dot-running { background: #1473e6; }
+
+    .progress-bar-wrap {
+      background: #eef0f3;
+      border-radius: 99px;
+      height: 6px;
+      overflow: hidden;
+      margin: 0.5rem 0 0.25rem;
+    }
+
+    .progress-bar-fill {
+      height: 100%;
+      background: #2d9d5f;
+      border-radius: 99px;
+      transition: width 0.25s ease;
+      width: 0%;
+    }
+
+    .progress-label { font-size: 0.75rem; color: #777; text-align: right; }
+
+    .asset-log {
+      margin-top: 0.6rem;
+      max-height: 160px;
+      overflow-y: auto;
+      border: 1px solid #eef0f3;
+      border-radius: 6px;
+    }
+
+    .asset-log-row {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.25rem 0.75rem;
+      font-size: 0.76rem;
+      border-bottom: 1px solid #f4f6f9;
+      color: #444;
+    }
+
+    .asset-log-row:last-child { border-bottom: none; }
+
+    /* ── Summary bar ── */
+    #summary {
+      display: none;
+      margin-top: 1rem;
+      padding: 0.85rem 1rem;
+      border-radius: 6px;
+      font-size: 0.85rem;
+      font-weight: 600;
+    }
+
+    #summary.ok      { background: #edfaf1; border: 1.5px solid #2d9d5f; color: #1a6e3f; }
+    #summary.partial { background: #fff8e6; border: 1.5px solid #e8a800; color: #7a5000; }
+    #summary.err     { background: #fff3f2; border: 1.5px solid #d7373f; color: #9e1c22; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="card-header">
+      <h1>AEM Assets — Create Folders &amp; Copy Assets</h1>
+      <p>author-p186976-e1967129.adobeaemcloud.com</p>
+    </div>
+    <div class="card-body">
+
+      <p class="section-title">Connection</p>
+
+      <div class="field">
+        <label for="host">AEM Host</label>
+        <input id="host" type="url"
+          value="https://author-p186976-e1967129.adobeaemcloud.com"
+          placeholder="https://author-p186976-e1967129.adobeaemcloud.com" />
+      </div>
+
+      <div class="field">
+        <label for="token">Bearer Token</label>
+        <input id="token" type="password"
+          placeholder="Paste your IMS bearer token" autocomplete="off" />
+      </div>
+
+      <div class="divider"></div>
+
+      <p class="section-title">Folders</p>
+
+      <div class="field">
+        <label for="parentPath">Parent DAM Path</label>
+        <input id="parentPath" type="text"
+          value="/content/dam"
+          placeholder="/content/dam or /content/dam/my-project" />
+      </div>
+
+      <div class="field">
+        <label for="folderNames">
+          Folder Names
+          <span class="hint">(comma-separated)</span>
+        </label>
+        <textarea id="folderNames"
+          placeholder="seat-01, seat-02, seat-03"></textarea>
+      </div>
+
+      <div class="divider"></div>
+
+      <p class="section-title">Copy Source</p>
+
+      <div class="field">
+        <label for="sourcePath">Source Folder</label>
+        <input id="sourcePath" type="text"
+          value="/content/dam/seat-00"
+          placeholder="/content/dam/seat-00" />
+      </div>
+
+      <button class="btn btn-primary" id="runBtn" type="button">
+        Create Folders &amp; Copy Assets
+      </button>
+
+      <!-- Results -->
+      <div id="results"></div>
+      <div id="summary"></div>
+
+    </div>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+
+    $('runBtn').addEventListener('click', run);
+
+    async function run() {
+      const host       = $('host').value.trim().replace(/\/$/, '');
+      const token      = $('token').value.trim();
+      const parentPath = $('parentPath').value.trim().replace(/\/$/, '');
+      const sourcePath = $('sourcePath').value.trim().replace(/\/$/, '');
+      const rawNames   = $('folderNames').value;
+
+      const folderNames = rawNames.split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+
+      if (!host || !token || !parentPath || !sourcePath || folderNames.length === 0) {
+        alert('Please fill in all fields and provide at least one folder name.');
+        return;
+      }
+
+      setBtn('runBtn', true, 'Running…');
+      $('summary').style.display = 'none';
+
+      // Build result rows
+      const resultsEl = $('results');
+      resultsEl.innerHTML = '';
+      resultsEl.style.display = 'block';
+
+      const rows = folderNames.map((name) => buildRow(resultsEl, name));
+
+      // List source assets once — shared across all folders
+      let sourceAssets = [];
+      try {
+        sourceAssets = await listAssets(host, token, sourcePath);
+      } catch (err) {
+        $('summary').className = 'err';
+        $('summary').textContent = `Failed to list assets in source folder: ${err.message}`;
+        $('summary').style.display = 'block';
+        setBtn('runBtn', false, 'Create Folders &amp; Copy Assets');
+        return;
+      }
+
+      let totalFolderErrors = 0;
+      let totalCopied = 0;
+      let totalCopyErrors = 0;
+
+      for (let i = 0; i < folderNames.length; i++) {
+        const name = folderNames[i];
+        const row  = rows[i];
+
+        // Open the active row
+        row.el.classList.add('open');
+
+        // ── Step 1: Create folder ──
+        setRowBadge(row, 'running', 'Creating…');
+        setStepDot(row.createDot, 'running');
+
+        const created = await createFolder(host, token, parentPath, name);
+        if (!created.ok) {
+          setStepDot(row.createDot, 'err');
+          row.createStep.querySelector('.step-text').textContent =
+            `Create failed — HTTP ${created.status}`;
+          setRowBadge(row, 'err', 'Failed');
+          totalFolderErrors++;
+          row.el.classList.remove('open'); // collapse failed row
+          continue;
+        }
+
+        setStepDot(row.createDot, 'ok');
+        row.createStep.querySelector('.step-text').textContent = 'Folder created';
+
+        if (sourceAssets.length === 0) {
+          setRowBadge(row, 'ok', 'Created (no assets)');
+          row.el.classList.remove('open');
+          continue;
+        }
+
+        // ── Step 2: Copy assets ──
+        setStepDot(row.copyDot, 'running');
+        row.progressWrap.style.display = 'block';
+
+        const destPath = `${parentPath}/${name}`;
+        let done = 0, errs = 0;
+
+        for (const asset of sourceAssets) {
+          const assetName = asset.properties?.name || asset.id?.split('/').pop();
+          const src = `${sourcePath}/${assetName}`;
+          const dst = `${destPath}/${assetName}`;
+          const logRow = addAssetRow(row.assetLog, assetName, 'pending');
+
+          try {
+            const r = await fetch('/proxy/copy-asset', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ host, token, sourcePath: src, destPath: dst }),
+            });
+
+            if (r.status === 201 || r.status === 200) {
+              logRow.querySelector('.step-dot').className = 'step-dot dot-ok';
+              done++;
+            } else {
+              logRow.querySelector('.step-dot').className = 'step-dot dot-err';
+              logRow.querySelector('.asset-name').textContent += ` (HTTP ${r.status})`;
+              errs++;
+            }
+          } catch {
+            logRow.querySelector('.step-dot').className = 'step-dot dot-err';
+            logRow.querySelector('.asset-name').textContent += ' (error)';
+            errs++;
+          }
+
+          setProgress(row, done + errs, sourceAssets.length);
+        }
+
+        totalCopied += done;
+        totalCopyErrors += errs;
+
+        if (errs === 0) {
+          setStepDot(row.copyDot, 'ok');
+          row.copyStep.querySelector('.step-text').textContent =
+            `${done} asset${done !== 1 ? 's' : ''} copied`;
+          setRowBadge(row, 'ok', `${done} copied`);
+        } else {
+          setStepDot(row.copyDot, 'err');
+          row.copyStep.querySelector('.step-text').textContent =
+            `${done} copied, ${errs} failed`;
+          setRowBadge(row, errs === sourceAssets.length ? 'err' : 'partial',
+            `${done}/${sourceAssets.length} copied`);
+        }
+
+        row.el.classList.remove('open'); // collapse when done
+      }
+
+      // ── Summary ──
+      const totalFolders = folderNames.length;
+      const okFolders = totalFolders - totalFolderErrors;
+      const summaryEl = $('summary');
+      summaryEl.style.display = 'block';
+
+      if (totalFolderErrors === 0 && totalCopyErrors === 0) {
+        summaryEl.className = 'ok';
+        summaryEl.textContent =
+          `Done — ${okFolders} folder${okFolders !== 1 ? 's' : ''} created, ${totalCopied} asset copies completed.`;
+      } else if (okFolders > 0) {
+        summaryEl.className = 'partial';
+        summaryEl.textContent =
+          `Completed with issues — ${okFolders}/${totalFolders} folders created, ` +
+          `${totalCopied} assets copied, ${totalCopyErrors} copy failures.`;
+      } else {
+        summaryEl.className = 'err';
+        summaryEl.textContent = `All ${totalFolders} folder creations failed.`;
+      }
+
+      setBtn('runBtn', false, 'Create Folders &amp; Copy Assets');
+    }
+
+    // ── API helpers ──────────────────────────────────────────────────────────
+
+    async function createFolder(host, token, parentPath, name) {
+      try {
+        const res = await fetch('/proxy/create-folder', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ host, token, parentPath, folderName: name, folderTitle: name }),
+        });
+        return { ok: res.status === 201, status: res.status };
+      } catch (e) {
+        return { ok: false, status: 0, error: e.message };
+      }
+    }
+
+    async function listAssets(host, token, folderPath) {
+      const res = await fetch('/proxy/list-assets', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ host, token, folderPath }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      return (data.entities || []).filter((e) => {
+        const cls = Array.isArray(e.class) ? e.class : [e.class || ''];
+        return cls.some((c) => c.includes('asset') && !c.includes('folder'));
+      });
+    }
+
+    // ── DOM helpers ──────────────────────────────────────────────────────────
+
+    function buildRow(container, name) {
+      const el = document.createElement('div');
+      el.className = 'folder-row';
+      el.innerHTML = `
+        <div class="folder-row-header">
+          <span class="chevron">&#9654;</span>
+          <span class="folder-name">${escapeHtml(name)}</span>
+          <span class="badge badge-pending">Pending</span>
+        </div>
+        <div class="folder-row-body">
+          <div class="step-line create-step">
+            <span class="step-dot dot-pending"></span>
+            <span class="step-text">Create folder</span>
+          </div>
+          <div class="step-line copy-step" style="margin-top:0.5rem">
+            <span class="step-dot dot-pending"></span>
+            <span class="step-text">Copy assets</span>
+          </div>
+          <div class="progress-wrap" style="display:none">
+            <div class="progress-bar-wrap">
+              <div class="progress-bar-fill"></div>
+            </div>
+            <p class="progress-label"></p>
+            <div class="asset-log"></div>
+          </div>
+        </div>`;
+
+      el.querySelector('.folder-row-header').addEventListener('click', () => {
+        el.classList.toggle('open');
+      });
+
+      container.appendChild(el);
+
+      return {
+        el,
+        badge:        el.querySelector('.badge'),
+        createStep:   el.querySelector('.create-step'),
+        createDot:    el.querySelector('.create-step .step-dot'),
+        copyStep:     el.querySelector('.copy-step'),
+        copyDot:      el.querySelector('.copy-step .step-dot'),
+        progressWrap: el.querySelector('.progress-wrap'),
+        progressFill: el.querySelector('.progress-bar-fill'),
+        progressLbl:  el.querySelector('.progress-label'),
+        assetLog:     el.querySelector('.asset-log'),
+      };
+    }
+
+    function setRowBadge(row, type, text) {
+      row.badge.className = `badge badge-${type}`;
+      row.badge.textContent = text;
+    }
+
+    function setStepDot(el, state) {
+      el.className = `step-dot dot-${state}`;
+    }
+
+    function setProgress(row, done, total) {
+      const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+      row.progressFill.style.width = `${pct}%`;
+      row.progressLbl.textContent = `${done} / ${total}`;
+    }
+
+    function addAssetRow(logEl, name, state) {
+      const row = document.createElement('div');
+      row.className = 'asset-log-row';
+      row.innerHTML = `<span class="step-dot dot-${state}"></span><span class="asset-name">${escapeHtml(name)}</span>`;
+      logEl.appendChild(row);
+      row.scrollIntoView({ block: 'nearest' });
+      return row;
+    }
+
+    function setBtn(id, disabled, label) {
+      const btn = $(id);
+      btn.disabled = disabled;
+      btn.innerHTML = disabled ? `<span class="spinner"></span>${label}` : label;
+    }
+
+    function escapeHtml(str) {
+      return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+    }
+  </script>
+</body>
+</html>
