@@ -284,70 +284,49 @@ const server = http.createServer(async (req, res) => {
     const mod = isHttps ? https : http;
 
     const isGrant    = effect !== 'deny';
-    const aceType    = isGrant ? 'rep:GrantACE' : 'rep:DenyACE';
-    const nameHint   = `${isGrant ? 'allow' : 'deny'}-${principalId}`;
-    const policyPath = `${folderPath}/rep:policy`;
+    const grantOrDeny = isGrant ? 'granted' : 'denied';
 
-    async function slingPost(path, params) {
-      const body = params.toString();
-      return new Promise((resolve, reject) => {
-        const opts = {
-          hostname: baseUrl.hostname,
-          port: baseUrl.port || (isHttps ? 443 : 80),
-          path,
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${token}`,
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'Content-Length': Buffer.byteLength(body),
-          },
-        };
-        console.log(`[proxy] POST ${host}${path}`);
-        const r = mod.request(opts, (res2) => {
-          let data = '';
-          res2.on('data', (c) => { data += c; });
-          res2.on('end', () => {
-            console.log(`[proxy]   → HTTP ${res2.statusCode}`);
-            resolve({ status: res2.statusCode, body: data });
-          });
+    // Use the Jackrabbit modifyAce Sling operation — posted to the folder path
+    // itself. This calls the Oak Security API properly rather than trying to
+    // manipulate rep:policy nodes directly (which are protected).
+    const params = new URLSearchParams();
+    params.append('_charset_', 'utf-8');
+    params.append(':operation', 'modifyAce');
+    params.append('principalId', principalId);
+    for (const priv of privileges) {
+      params.append(`privilege@${priv}`, grantOrDeny);
+    }
+    const formBody = params.toString();
+
+    const options = {
+      hostname: baseUrl.hostname,
+      port: baseUrl.port || (isHttps ? 443 : 80),
+      path: folderPath,   // POST to the folder itself, not rep:policy
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(formBody),
+      },
+    };
+
+    console.log(`[proxy] POST ${host}${folderPath} :operation=modifyAce (${principalId} ${grantOrDeny})`);
+
+    const r = await new Promise((resolve, reject) => {
+      const req2 = mod.request(options, (res2) => {
+        let data = '';
+        res2.on('data', (c) => { data += c; });
+        res2.on('end', () => {
+          console.log(`[proxy]   → HTTP ${res2.statusCode}`);
+          resolve({ status: res2.statusCode, body: data });
         });
-        r.on('error', reject);
-        r.write(body);
-        r.end();
       });
-    }
+      req2.on('error', reject);
+      req2.write(formBody);
+      req2.end();
+    }).catch((e) => ({ status: 502, body: JSON.stringify({ error: e.message }) }));
 
-    try {
-      // Step 1: Ensure rep:policy node exists on the destination folder.
-      const policyParams = new URLSearchParams();
-      policyParams.append('_charset_', 'utf-8');
-      policyParams.append('jcr:primaryType', 'rep:ACL');
-      const policyRes = await slingPost(policyPath, policyParams);
-      // 200 = updated, 201 = created, 409 = already exists (all acceptable)
-      if (![200, 201, 409].includes(policyRes.status)) {
-        return sendJSON(res, policyRes.status, {
-          error: `Failed to create rep:policy (HTTP ${policyRes.status})`,
-          detail: policyRes.body,
-        });
-      }
-
-      // Step 2: Create the ACE child node under rep:policy.
-      const aceParams = new URLSearchParams();
-      aceParams.append('_charset_', 'utf-8');
-      aceParams.append(':nameHint', nameHint);
-      aceParams.append('jcr:primaryType', aceType);
-      aceParams.append('rep:principalName', principalId);
-      aceParams.append('rep:privileges@TypeHint', 'String[]');
-      for (const priv of privileges) {
-        aceParams.append('rep:privileges', priv);
-      }
-      const aceRes = await slingPost(policyPath, aceParams);
-
-      sendJSON(res, aceRes.status, aceRes.body || JSON.stringify({ status: aceRes.status }));
-    } catch (e) {
-      console.error('[proxy] set-permissions error:', e.message);
-      sendJSON(res, 502, { error: e.message });
-    }
+    sendJSON(res, r.status, r.body || JSON.stringify({ status: r.status }));
     return;
   }
 
