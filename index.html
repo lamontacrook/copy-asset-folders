@@ -625,13 +625,27 @@
       const rows = entries.map(({ folderName, folderTitle }) =>
         buildRow(resultsEl, folderName, folderTitle));
 
-      // ── Fetch source permissions once, shared across all folders ──
+      // ── Fetch source permissions + MAC group memberships once ──
       let sourceAces = [];
+      let sourceGroupMembers = {}; // { principalId: { groupPath, members: [...] } }
       try {
         sourceAces = await fetchAces(host, token, sourcePath);
-      } catch (e) {
-        // Non-fatal — we'll note it per-row but continue
-      }
+      } catch (e) { /* Non-fatal */ }
+
+      try {
+        const r = await fetch('/proxy/get-group-members', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ host, token, folderPath: sourcePath }),
+        });
+        if (r.ok) {
+          const data = await r.json();
+          sourceGroupMembers = data.groups || {};
+          const total = Object.values(sourceGroupMembers)
+            .reduce((n, g) => n + (g.members || []).length, 0);
+          console.log(`Source group members: ${total} member(s) across ${Object.keys(sourceGroupMembers).length} group(s)`);
+        }
+      } catch (e) { /* Non-fatal */ }
 
       let ok = 0, errs = 0;
 
@@ -745,6 +759,48 @@
             }
           } else {
             addStepRow(row, 'pending', 'No explicit ACEs on source folder (permissions inherited from parent)');
+          }
+
+          // ── Step 4: Copy MAC group memberships ────────────────────────────
+          // AEM Assets "Add Members" stores users as rep:members on the MAC group
+          // node — NOT as ACEs in rep:policy. We copy those memberships here.
+          const groupsWithMembers = Object.entries(sourceGroupMembers)
+            .filter(([, g]) => g.groupPath && g.members && g.members.length > 0);
+
+          if (groupsWithMembers.length > 0) {
+            const totalMembers = groupsWithMembers.reduce((n, [, g]) => n + g.members.length, 0);
+            addStepRow(row, 'running', `Copying ${totalMembers} group member${totalMembers !== 1 ? 's' : ''}…`);
+            let memberOk = 0, memberErr = 0;
+            const memberErrors = [];
+
+            for (const [principalId, { groupPath, members }] of groupsWithMembers) {
+              try {
+                const r = await fetch('/proxy/add-group-members', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ host, token, groupPath, members }),
+                });
+                if (r.ok || r.status === 200 || r.status === 201) {
+                  memberOk += members.length;
+                } else {
+                  const detail = await r.text();
+                  memberErrors.push(`${principalId}: HTTP ${r.status} — ${detail.substring(0, 100)}`);
+                  memberErr++;
+                }
+              } catch (e) {
+                memberErrors.push(`${principalId}: ${e.message}`);
+                memberErr++;
+              }
+            }
+
+            if (memberErr === 0) {
+              updateLastStep(row, 'ok', `${memberOk} member${memberOk !== 1 ? 's' : ''} added to groups`);
+            } else {
+              updateLastStep(row, memberOk > 0 ? 'pending' : 'err',
+                `${memberOk} ok, ${memberErr} group(s) failed`);
+              row.detail.textContent += '\n\nGroup member errors:\n' + memberErrors.join('\n');
+              row.detail.style.display = 'block';
+            }
           }
 
           setRowBadge(row, 'ok', 'Done');

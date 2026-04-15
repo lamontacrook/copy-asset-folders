@@ -568,6 +568,172 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // ── POST /proxy/get-group-members ────────────────────────────────────────
+  // Returns rep:members for each MAC group listed in a folder's rep:policy.
+  // AEM Assets "Add Members" UI stores users as rep:members on the MAC group
+  // node in /home/groups/mac/, NOT as direct ACEs in rep:policy.
+  if (req.method === 'POST' && req.url === '/proxy/get-group-members') {
+    let payload;
+    try { payload = JSON.parse(await readBody(req)); }
+    catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+
+    const { host, token, folderPath } = payload;
+    if (!host || !token || !folderPath)
+      return sendJSON(res, 400, { error: 'Missing required fields: host, token, folderPath' });
+
+    let baseUrl;
+    try { baseUrl = new URL(host); } catch { return sendJSON(res, 400, { error: 'Invalid host URL' }); }
+
+    const isHttps = baseUrl.protocol === 'https:';
+    const mod = isHttps ? https : http;
+    const authHdr = `Bearer ${token}`;
+
+    function get(path) {
+      return new Promise((resolve, reject) => {
+        const opts = { hostname: baseUrl.hostname, port: baseUrl.port || (isHttps ? 443 : 80),
+          path, method: 'GET', headers: { 'Authorization': authHdr } };
+        console.log(`[proxy] GET ${host}${path}`);
+        const r = mod.request(opts, (res2) => {
+          let d = '';
+          res2.on('data', c => { d += c; });
+          res2.on('end', () => { console.log(`[proxy]   → HTTP ${res2.statusCode}`); resolve({ status: res2.statusCode, body: d }); });
+        });
+        r.on('error', reject);
+        r.end();
+      });
+    }
+
+    // Step 1: Read the folder's rep:policy to find group principals
+    let policy;
+    try {
+      const r = await get(`${folderPath}/rep:policy.infinity.json`);
+      if (r.status !== 200) return sendJSON(res, r.status, { error: `rep:policy fetch returned ${r.status}` });
+      policy = JSON.parse(r.body);
+    } catch (e) {
+      return sendJSON(res, 502, { error: e.message });
+    }
+
+    const principals = Object.values(policy)
+      .filter(v => v && typeof v === 'object' &&
+        (v['jcr:primaryType'] === 'rep:GrantACE' || v['jcr:primaryType'] === 'rep:DenyACE'))
+      .map(v => v['rep:principalName'])
+      .filter(Boolean);
+
+    console.log(`[proxy] get-group-members: principals in rep:policy: ${principals.join(', ')}`);
+
+    // Step 2: For each principal, try to read group members via QueryBuilder
+    const groups = {};
+    for (const principalId of principals) {
+      try {
+        // Search for the group node
+        const qb = await get(`/bin/querybuilder.json?type=rep:Group&property=rep:principalName&property.value=${encodeURIComponent(principalId)}&p.limit=1&p.hits=full`);
+        if (qb.status === 200) {
+          const data = JSON.parse(qb.body);
+          const hits = data.hits || [];
+          if (hits.length > 0) {
+            const groupPath = hits[0]['jcr:path'];
+            // Read the group node to get rep:members
+            const grp = await get(`${groupPath}.1.json`);
+            if (grp.status === 200) {
+              const groupData = JSON.parse(grp.body);
+              const members = groupData['rep:members'] || [];
+              const memberList = Array.isArray(members) ? members : [members];
+              console.log(`[proxy] group "${principalId}" at ${groupPath}: ${memberList.length} member(s)`);
+              groups[principalId] = { groupPath, members: memberList };
+            }
+          } else {
+            console.log(`[proxy] group "${principalId}": not found via QueryBuilder`);
+            groups[principalId] = { groupPath: null, members: [] };
+          }
+        }
+      } catch (e) {
+        console.warn(`[proxy] get-group-members error for ${principalId}: ${e.message}`);
+        groups[principalId] = { groupPath: null, members: [], error: e.message };
+      }
+    }
+
+    sendJSON(res, 200, { groups });
+    return;
+  }
+
+  // ── POST /proxy/add-group-members ─────────────────────────────────────────
+  // Adds members to a group by path using Sling POST servlet.
+  if (req.method === 'POST' && req.url === '/proxy/add-group-members') {
+    let payload;
+    try { payload = JSON.parse(await readBody(req)); }
+    catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+
+    const { host, token, groupPath, members } = payload;
+    if (!host || !token || !groupPath || !Array.isArray(members))
+      return sendJSON(res, 400, { error: 'Missing required fields: host, token, groupPath, members' });
+
+    let baseUrl;
+    try { baseUrl = new URL(host); } catch { return sendJSON(res, 400, { error: 'Invalid host URL' }); }
+
+    const isHttps = baseUrl.protocol === 'https:';
+    const mod = isHttps ? https : http;
+    const authHdr = `Bearer ${token}`;
+
+    // Fetch a CSRF token
+    let csrfToken = '';
+    let csrfCookie = '';
+    try {
+      await new Promise((resolve, reject) => {
+        const opts = { hostname: baseUrl.hostname, port: baseUrl.port || (isHttps ? 443 : 80),
+          path: '/libs/granite/csrf/token.json', method: 'GET',
+          headers: { 'Authorization': authHdr, 'Accept': 'application/json' } };
+        const r = mod.request(opts, res2 => {
+          let d = '';
+          res2.on('data', c => { d += c; });
+          res2.on('end', () => {
+            csrfToken = (JSON.parse(d).token || '');
+            const sc = res2.headers['set-cookie'];
+            if (sc) csrfCookie = (Array.isArray(sc) ? sc : [sc]).map(c => c.split(';')[0]).join('; ');
+            resolve();
+          });
+        });
+        r.on('error', reject);
+        r.end();
+      });
+    } catch (e) { console.warn(`[proxy] CSRF error: ${e.message}`); }
+
+    // Use the Jackrabbit user manager API to add members to the group
+    // POST to {groupPath}.rw.userprops.html with :member[] params
+    const params = new URLSearchParams();
+    params.append('_charset_', 'utf-8');
+    for (const m of members) params.append(':member', m);
+    if (csrfToken) params.append(':cq_csrf_token', csrfToken);
+    const formBody = params.toString();
+
+    const postHeaders = {
+      'Authorization': authHdr,
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Content-Length': Buffer.byteLength(formBody),
+      'Referer': host,
+    };
+    if (csrfCookie) postHeaders['Cookie'] = csrfCookie;
+
+    const result = await new Promise((resolve, reject) => {
+      const opts = { hostname: baseUrl.hostname, port: baseUrl.port || (isHttps ? 443 : 80),
+        path: `${groupPath}.rw.userprops.html`, method: 'POST', headers: postHeaders };
+      console.log(`[proxy] POST ${host}${groupPath}.rw.userprops.html (add ${members.length} member(s))`);
+      const r = mod.request(opts, res2 => {
+        let d = '';
+        res2.on('data', c => { d += c; });
+        res2.on('end', () => {
+          console.log(`[proxy]   → HTTP ${res2.statusCode}`);
+          resolve({ status: res2.statusCode, body: d });
+        });
+      });
+      r.on('error', reject);
+      r.write(formBody);
+      r.end();
+    }).catch(e => ({ status: 502, body: JSON.stringify({ error: e.message }) }));
+
+    sendJSON(res, result.status, result.body || JSON.stringify({ status: result.status }));
+    return;
+  }
+
   res.writeHead(404);
   res.end('Not found');
 });
