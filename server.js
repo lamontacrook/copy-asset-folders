@@ -165,6 +165,110 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // ── POST /proxy/get-permissions ──────────────────────────────────────────
+  // Returns the current ACL for a DAM folder path.
+  if (req.method === 'POST' && req.url === '/proxy/get-permissions') {
+    let payload;
+    try { payload = JSON.parse(await readBody(req)); }
+    catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+
+    const { host, token, folderPath } = payload;
+    if (!host || !token || !folderPath)
+      return sendJSON(res, 400, { error: 'Missing required fields: host, token, folderPath' });
+
+    // ACLs in AEM are stored as a rep:policy child node under the folder path.
+    let baseUrl;
+    try { baseUrl = new URL(host); } catch { return sendJSON(res, 400, { error: 'Invalid host URL' }); }
+
+    const isHttps = baseUrl.protocol === 'https:';
+    const mod = isHttps ? https : http;
+
+    // Fetch the rep:policy node with full depth so all ACEs are included
+    const jsonAclPath = `${folderPath}/rep:policy.infinity.json`;
+
+    const options = {
+      hostname: baseUrl.hostname,
+      port: baseUrl.port || (isHttps ? 443 : 80),
+      path: jsonAclPath,
+      method: 'GET',
+      headers: { 'Authorization': `Bearer ${token}` },
+    };
+
+    console.log(`[proxy] GET ${host}${jsonAclPath}`);
+
+    const r = await new Promise((resolve, reject) => {
+      const req2 = mod.request(options, (res2) => {
+        let data = '';
+        res2.on('data', (c) => { data += c; });
+        res2.on('end', () => resolve({ status: res2.statusCode, body: data }));
+      });
+      req2.on('error', reject);
+      req2.end();
+    }).catch((e) => ({ status: 502, body: JSON.stringify({ error: e.message }) }));
+
+    console.log(`[proxy] Response: HTTP ${r.status}`);
+    sendJSON(res, r.status, r.body);
+    return;
+  }
+
+  // ── POST /proxy/set-permissions ───────────────────────────────────────────
+  // Sets an ACE (Access Control Entry) on a DAM folder for a given principal.
+  if (req.method === 'POST' && req.url === '/proxy/set-permissions') {
+    let payload;
+    try { payload = JSON.parse(await readBody(req)); }
+    catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+
+    const { host, token, folderPath, principalId, privileges, effect } = payload;
+    if (!host || !token || !folderPath || !principalId || !privileges?.length)
+      return sendJSON(res, 400, { error: 'Missing required fields: host, token, folderPath, principalId, privileges' });
+
+    let baseUrl;
+    try { baseUrl = new URL(host); } catch { return sendJSON(res, 400, { error: 'Invalid host URL' }); }
+
+    const isHttps = baseUrl.protocol === 'https:';
+    const mod = isHttps ? https : http;
+
+    // Build form-urlencoded body for the Jackrabbit ACL servlet
+    const grantOrDeny = effect === 'deny' ? 'denied' : 'granted';
+    const params = new URLSearchParams();
+    params.append('_charset_', 'utf-8');
+    params.append('path', folderPath);
+    params.append('principalId', principalId);
+    for (const priv of privileges) {
+      params.append(`privilege@${priv}`, grantOrDeny);
+    }
+    const formBody = params.toString();
+
+    const options = {
+      hostname: baseUrl.hostname,
+      port: baseUrl.port || (isHttps ? 443 : 80),
+      path: '/crx/de/index.jsp',
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(formBody),
+      },
+    };
+
+    console.log(`[proxy] POST ${host}/crx/de/index.jsp (set ACE: ${principalId} ${grantOrDeny} on ${folderPath})`);
+
+    const r = await new Promise((resolve, reject) => {
+      const req2 = mod.request(options, (res2) => {
+        let data = '';
+        res2.on('data', (c) => { data += c; });
+        res2.on('end', () => resolve({ status: res2.statusCode, body: data }));
+      });
+      req2.on('error', reject);
+      req2.write(formBody);
+      req2.end();
+    }).catch((e) => ({ status: 502, body: JSON.stringify({ error: e.message }) }));
+
+    console.log(`[proxy] Response: HTTP ${r.status}`);
+    sendJSON(res, r.status, r.body || JSON.stringify({ status: r.status }));
+    return;
+  }
+
   res.writeHead(404);
   res.end('Not found');
 });
