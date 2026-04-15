@@ -399,6 +399,7 @@ const server = http.createServer(async (req, res) => {
 
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+    // Returns { status, body, headers } — headers lets callers forward Set-Cookie.
     function makeReq(method, path, headers, body) {
       return new Promise((resolve, reject) => {
         const opts = { hostname, port, path, method, headers };
@@ -408,7 +409,7 @@ const server = http.createServer(async (req, res) => {
           res2.on('data', (c) => { data += c; });
           res2.on('end', () => {
             console.log(`[proxy]   → HTTP ${res2.statusCode}`);
-            resolve({ status: res2.statusCode, body: data });
+            resolve({ status: res2.statusCode, body: data, headers: res2.headers });
           });
         });
         r.on('error', reject);
@@ -438,17 +439,46 @@ const server = http.createServer(async (req, res) => {
 
     console.log(`[proxy] apply-aces: ${merged.size} unique principal(s) for ${folderPath}`);
 
+    // Verify which principals actually exist in AEM before calling modifyAce.
+    // Oak's modifyAce returns 422 "invalid payload" for unknown principals.
+    async function principalExists(principalId) {
+      try {
+        const r = await makeReq('GET',
+          `/libs/granite/security/search/authorizables.json?type=group&query=${encodeURIComponent(principalId)}&chunk=0&limit=5`,
+          { 'Authorization': authHdr, 'Accept': 'application/json' });
+        if (r.status !== 200) return true; // can't verify — attempt anyway
+        const data = JSON.parse(r.body);
+        const items = data.authorizables || data.hits || [];
+        const found = items.some((a) => a.id === principalId || a.name === principalId || a.rep_principalName === principalId);
+        console.log(`[proxy] principal "${principalId}" exists: ${found} (${items.length} results)`);
+        return found;
+      } catch (e) {
+        console.warn(`[proxy] principal check failed (${e.message}) — will attempt anyway`);
+        return true;
+      }
+    }
+
     const results = [];
     let lastCsrfToken = null;
+    let lastCsrfCookie = '';
 
     for (const { principalId, effect, privSet } of merged.values()) {
       const expandedPrivileges = [...privSet];
       if (expandedPrivileges.length === 0) continue;
 
-      // Poll for a fresh CSRF token (different from the last one we used).
-      // AEM issues time-based tokens with 1-second granularity; calling too fast
-      // yields the same token twice. We retry every 200 ms until the token changes.
+      // Check principal existence first to avoid wasting CSRF tokens on known-bad principals.
+      const exists = await principalExists(principalId);
+      if (!exists) {
+        console.warn(`[proxy] Skipping "${principalId}" — principal not found in AEM`);
+        results.push({ principalId, effect, status: 404, ok: false, error: 'principal not found' });
+        continue;
+      }
+
+      // Poll for a fresh CSRF token (different from the last one used).
+      // AEM tokens are time-based JWTs with 1-second granularity; same-second
+      // calls get the same token, which is single-use.
       let csrfToken = '';
+      let csrfCookie = lastCsrfCookie;
       for (let attempt = 0; attempt < 20; attempt++) {
         if (attempt > 0) await sleep(200);
         try {
@@ -456,6 +486,13 @@ const server = http.createServer(async (req, res) => {
             'Authorization': authHdr, 'Accept': 'application/json',
           });
           csrfToken = (JSON.parse(csrfRes.body).token || '');
+          // Forward any Set-Cookie headers AEM sends — CSRF validation may rely on them.
+          const sc = csrfRes.headers['set-cookie'];
+          if (sc) {
+            const cookies = Array.isArray(sc) ? sc : [sc];
+            csrfCookie = cookies.map((c) => c.split(';')[0]).join('; ');
+            lastCsrfCookie = csrfCookie;
+          }
         } catch (e) {
           console.warn(`[proxy] CSRF fetch error: ${e.message}`);
         }
@@ -463,8 +500,8 @@ const server = http.createServer(async (req, res) => {
         console.log(`[proxy] CSRF token unchanged (attempt ${attempt + 1}), waiting 200 ms…`);
       }
       lastCsrfToken = csrfToken;
-      console.log(`[proxy] principal: ${principalId}, effect: ${effect}, privs: ${expandedPrivileges.join(', ')}`);
-      console.log(`[proxy] CSRF token: ${csrfToken ? csrfToken.slice(0, 20) + '…' : '(none)'}`);
+      console.log(`[proxy] principal: ${principalId} | effect: ${effect} | privs: ${expandedPrivileges.join(', ')}`);
+      console.log(`[proxy] CSRF: ${csrfToken ? csrfToken.slice(0, 20) + '…' : '(none)'} | cookies: ${csrfCookie || '(none)'}`);
 
       const params = new URLSearchParams();
       params.append('_charset_', 'utf-8');
@@ -473,16 +510,19 @@ const server = http.createServer(async (req, res) => {
       for (const priv of expandedPrivileges) params.append(`privilege@${priv}`, effect !== 'deny' ? 'granted' : 'denied');
       const formBody = params.toString();
 
-      try {
-        const r = await makeReq('POST', `${folderPath}.modifyAce.html`, {
-          'Authorization': authHdr,
-          'Content-Type': 'application/x-www-form-urlencoded',
-          'Content-Length': Buffer.byteLength(formBody),
-          'Referer': host,
-        }, formBody);
+      const postHeaders = {
+        'Authorization': authHdr,
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(formBody),
+        'Referer': host,
+      };
+      if (csrfCookie) postHeaders['Cookie'] = csrfCookie;
 
+      try {
+        const r = await makeReq('POST', `${folderPath}.modifyAce.html`, postHeaders, formBody);
         const ok = r.status === 200 || r.status === 201;
         if (!ok) console.error(`[proxy] modifyAce FAILED HTTP ${r.status}: ${r.body.slice(0, 300)}`);
+        else console.log(`[proxy] modifyAce OK for ${principalId}`);
         results.push({ principalId, effect, status: r.status, ok });
       } catch (e) {
         console.error(`[proxy] modifyAce error for ${principalId}: ${e.message}`);
