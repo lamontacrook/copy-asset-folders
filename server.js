@@ -341,7 +341,11 @@ const server = http.createServer(async (req, res) => {
         'Content-Length': Buffer.byteLength(formBody),
       }, formBody);
 
-    sendJSON(res, r.status, r.body || JSON.stringify({ status: r.status }));
+      sendJSON(res, r.status, r.body || JSON.stringify({ status: r.status }));
+    } catch (e) {
+      console.error('[proxy] set-permissions error:', e.message);
+      sendJSON(res, 502, { error: e.message });
+    }
     return;
   }
 
