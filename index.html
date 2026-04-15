@@ -306,6 +306,7 @@
     .folder-row-header:hover { background: #f0f4f9; }
 
     .folder-name { font-size: 0.88rem; font-weight: 600; color: #1a1a1a; flex: 1; }
+    .row-title   { font-weight: 400; color: #888; margin-left: 0.4rem; font-size: 0.82rem; }
 
     .badge {
       font-size: 0.72rem;
@@ -454,10 +455,10 @@
 
       <div class="field">
         <label for="folderNames">
-          Destination Folder Names
-          <span class="hint">(comma-separated)</span>
+          Destinations
+          <span class="hint">(one per line or comma-separated — use <code style="font-size:0.8em">name | Title</code> to set a display title)</span>
         </label>
-        <textarea id="folderNames" placeholder="seat-01, seat-02, seat-03"></textarea>
+        <textarea id="folderNames" placeholder="seat-01&#10;seat-02 | Seat 02&#10;seat-03 | Seat 03"></textarea>
       </div>
 
       <button class="btn btn-primary" id="runBtn" type="button">
@@ -588,16 +589,28 @@
 
     $('runBtn').addEventListener('click', run);
 
+    // Parse "name | title" entries from the textarea (comma or newline separated).
+    function parseFolderEntries(raw) {
+      return raw
+        .split(/[\n,]+/)
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .map((entry) => {
+          const [name, ...rest] = entry.split('|');
+          const folderName  = name.trim();
+          const folderTitle = rest.length ? rest.join('|').trim() : folderName;
+          return { folderName, folderTitle };
+        });
+    }
+
     async function run() {
       const host       = $('host').value.trim().replace(/\/$/, '');
       const token      = $('token').value.trim();
       const parentPath = $('parentPath').value.trim().replace(/\/$/, '');
       const sourcePath = $('sourcePath').value.trim().replace(/\/$/, '');
-      const rawNames   = $('folderNames').value;
+      const entries    = parseFolderEntries($('folderNames').value);
 
-      const folderNames = rawNames.split(',').map((s) => s.trim()).filter(Boolean);
-
-      if (!host || !token || !parentPath || !sourcePath || folderNames.length === 0) {
+      if (!host || !token || !parentPath || !sourcePath || entries.length === 0) {
         alert('Please fill in all fields and provide at least one destination folder name.');
         return;
       }
@@ -609,19 +622,22 @@
       resultsEl.innerHTML = '';
       resultsEl.style.display = 'block';
 
-      const rows = folderNames.map((name) => buildRow(resultsEl, name));
+      const rows = entries.map(({ folderName, folderTitle }) =>
+        buildRow(resultsEl, folderName, folderTitle));
 
       let ok = 0, errs = 0;
 
-      for (let i = 0; i < folderNames.length; i++) {
-        const name    = folderNames[i];
-        const row     = rows[i];
-        const destPath = `${parentPath}/${name}`;
+      for (let i = 0; i < entries.length; i++) {
+        const { folderName, folderTitle } = entries[i];
+        const row      = rows[i];
+        const destPath = `${parentPath}/${folderName}`;
 
         setRowBadge(row, 'running', 'Copying…');
-        setStepDot(row.stepDot, 'running');
         row.el.classList.add('open');
 
+        // ── Step 1: Copy folder ──
+        addStepRow(row, 'running', 'Copying folder…');
+        let copyOk = false;
         try {
           const r = await fetch('/proxy/copy-asset', {
             method: 'POST',
@@ -630,24 +646,45 @@
           });
 
           if (r.status === 201 || r.status === 200) {
-            setStepDot(row.stepDot, 'ok');
-            row.stepLine.querySelector('.step-text').textContent = `Copied to ${destPath}`;
-            setRowBadge(row, 'ok', 'Copied');
-            ok++;
+            updateLastStep(row, 'ok', `Folder copied → ${destPath}`);
+            copyOk = true;
           } else {
             const msg = await r.text();
-            setStepDot(row.stepDot, 'err');
-            row.stepLine.querySelector('.step-text').textContent = `Failed — HTTP ${r.status}`;
-            row.el.querySelector('.step-detail').textContent = msg;
-            row.el.querySelector('.step-detail').style.display = 'block';
+            updateLastStep(row, 'err', `Copy failed — HTTP ${r.status}`);
+            row.detail.textContent = msg;
+            row.detail.style.display = 'block';
             setRowBadge(row, 'err', 'Failed');
             errs++;
           }
         } catch (e) {
-          setStepDot(row.stepDot, 'err');
-          row.stepLine.querySelector('.step-text').textContent = `Error — ${e.message}`;
+          updateLastStep(row, 'err', `Copy error — ${e.message}`);
           setRowBadge(row, 'err', 'Error');
           errs++;
+        }
+
+        // ── Step 2: Set title (only if copy succeeded and title differs from name) ──
+        if (copyOk) {
+          if (folderTitle !== folderName) {
+            addStepRow(row, 'running', `Setting title to "${folderTitle}"…`);
+            try {
+              const r = await fetch('/proxy/update-folder', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ host, token, folderPath: destPath, folderTitle }),
+              });
+
+              if (r.status === 200 || r.status === 204) {
+                updateLastStep(row, 'ok', `Title set to "${folderTitle}"`);
+              } else {
+                updateLastStep(row, 'err', `Title update failed — HTTP ${r.status}`);
+              }
+            } catch (e) {
+              updateLastStep(row, 'err', `Title update error — ${e.message}`);
+            }
+          }
+
+          setRowBadge(row, 'ok', 'Done');
+          ok++;
         }
 
         row.el.classList.remove('open');
@@ -802,20 +839,19 @@
 
     // ── DOM helpers ───────────────────────────────────────────────────────────
 
-    function buildRow(container, name) {
+    function buildRow(container, name, title) {
       const el = document.createElement('div');
       el.className = 'folder-row';
+      const subtitle = title && title !== name
+        ? `<span class="row-title">${escapeHtml(title)}</span>` : '';
       el.innerHTML = `
         <div class="folder-row-header">
           <span class="chevron">&#9654;</span>
-          <span class="folder-name">${escapeHtml(name)}</span>
+          <span class="folder-name">${escapeHtml(name)}${subtitle}</span>
           <span class="badge badge-pending">Pending</span>
         </div>
         <div class="folder-row-body">
-          <div class="step-line">
-            <span class="step-dot dot-pending"></span>
-            <span class="step-text">Waiting…</span>
-          </div>
+          <div class="step-list"></div>
           <pre class="step-detail" style="display:none;margin-top:0.5rem;font-size:0.75rem;white-space:pre-wrap;word-break:break-all;color:#9e1c22;opacity:0.85"></pre>
         </div>`;
 
@@ -825,9 +861,25 @@
       return {
         el,
         badge:    el.querySelector('.badge'),
-        stepLine: el.querySelector('.step-line'),
-        stepDot:  el.querySelector('.step-dot'),
+        stepList: el.querySelector('.step-list'),
+        detail:   el.querySelector('.step-detail'),
       };
+    }
+
+    function addStepRow(row, state, text) {
+      const line = document.createElement('div');
+      line.className = 'step-line';
+      line.innerHTML = `<span class="step-dot dot-${state}"></span><span class="step-text">${escapeHtml(text)}</span>`;
+      row.stepList.appendChild(line);
+      return line;
+    }
+
+    function updateLastStep(row, state, text) {
+      const lines = row.stepList.querySelectorAll('.step-line');
+      const last  = lines[lines.length - 1];
+      if (!last) return;
+      last.querySelector('.step-dot').className = `step-dot dot-${state}`;
+      last.querySelector('.step-text').textContent = text;
     }
 
     function setRowBadge(row, type, text) {

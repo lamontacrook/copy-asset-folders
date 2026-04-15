@@ -165,6 +165,32 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // ── POST /proxy/update-folder ────────────────────────────────────────────
+  // Updates dc:title (and optionally other properties) on an existing folder.
+  if (req.method === 'POST' && req.url === '/proxy/update-folder') {
+    let payload;
+    try { payload = JSON.parse(await readBody(req)); }
+    catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+
+    const { host, token, folderPath, folderTitle } = payload;
+    if (!host || !token || !folderPath || !folderTitle)
+      return sendJSON(res, 400, { error: 'Missing required fields: host, token, folderPath, folderTitle' });
+
+    const apiPath = `/api/assets${toApiPath(folderPath)}`;
+    const body = JSON.stringify({
+      class: 'assetFolder',
+      properties: { 'dc:title': folderTitle },
+    });
+
+    try {
+      const r = await aemRequest(host, 'PUT', apiPath, token, body);
+      sendJSON(res, r.status, r.body || JSON.stringify({ status: r.status }));
+    } catch (e) {
+      sendJSON(res, 502, { error: e.message });
+    }
+    return;
+  }
+
   // ── POST /proxy/get-permissions ──────────────────────────────────────────
   // Returns the current ACL for a DAM folder path.
   if (req.method === 'POST' && req.url === '/proxy/get-permissions') {
