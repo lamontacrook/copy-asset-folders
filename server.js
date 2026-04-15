@@ -305,6 +305,21 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+    // Expand aggregate privileges — modifyAce rejects jcr:all / jcr:write
+    // as composites on some AEM versions; expand them to base privileges.
+    const AGGREGATE = {
+      'jcr:all':   ['jcr:read','jcr:write','jcr:readAccessControl','jcr:modifyAccessControl',
+                    'jcr:lockManagement','jcr:versionManagement','jcr:nodeTypeManagement',
+                    'jcr:retentionManagement','jcr:lifecycleManagement','rep:write',
+                    'crx:replicate'],
+      'jcr:write': ['jcr:modifyProperties','jcr:addChildNodes','jcr:removeNode','jcr:removeChildNodes'],
+      'rep:write': ['jcr:modifyProperties','jcr:addChildNodes','jcr:removeNode',
+                    'jcr:removeChildNodes','jcr:nodeTypeManagement'],
+    };
+    const expandedPrivileges = [...new Set(
+      privileges.flatMap((p) => AGGREGATE[p] || [p])
+    )];
+
     try {
       // Step 1: Fetch a CSRF token — required by AEM for mutating POST requests.
       const csrfRes = await makeRequest('GET', '/libs/granite/csrf/token.json', {
@@ -316,11 +331,13 @@ const server = http.createServer(async (req, res) => {
       try {
         const csrfData = JSON.parse(csrfRes.body);
         csrfToken = csrfData.token || '';
-      } catch { /* non-fatal — try without token */ }
+      } catch { /* non-fatal */ }
 
       console.log(`[proxy] CSRF token: ${csrfToken ? 'obtained' : 'unavailable'}`);
+      console.log(`[proxy] principal: ${principalId}, effect: ${effect}`);
+      console.log(`[proxy] privileges (expanded): ${expandedPrivileges.join(', ')}`);
 
-      // Step 2: POST to <folderPath>.modifyAce.html with the ACE parameters.
+      // Step 2: POST to <folderPath>.modifyAce.html
       const isGrant     = effect !== 'deny';
       const grantOrDeny = isGrant ? 'granted' : 'denied';
 
@@ -328,12 +345,12 @@ const server = http.createServer(async (req, res) => {
       params.append('_charset_', 'utf-8');
       params.append('principalId', principalId);
       if (csrfToken) params.append(':cq_csrf_token', csrfToken);
-      for (const priv of privileges) {
+      for (const priv of expandedPrivileges) {
         params.append(`privilege@${priv}`, grantOrDeny);
       }
       const formBody = params.toString();
+      console.log(`[proxy] POST body: ${formBody}`);
 
-      // .modifyAce.html is the registered Sling Jackrabbit Access Manager selector
       const aceUrl = `${folderPath}.modifyAce.html`;
       const r = await makeRequest('POST', aceUrl, {
         'Authorization': authHdr,
@@ -341,6 +358,9 @@ const server = http.createServer(async (req, res) => {
         'Content-Length': Buffer.byteLength(formBody),
       }, formBody);
 
+      if (r.status !== 200 && r.status !== 201) {
+        console.error(`[proxy] modifyAce failed HTTP ${r.status}:\n${r.body}`);
+      }
       sendJSON(res, r.status, r.body || JSON.stringify({ status: r.status }));
     } catch (e) {
       console.error('[proxy] set-permissions error:', e.message);
