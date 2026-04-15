@@ -694,6 +694,7 @@
           if (sourceAces.length > 0) {
             addStepRow(row, 'running', `Copying ${sourceAces.length} permission${sourceAces.length !== 1 ? 's' : ''}…`);
             let permOk = 0, permErr = 0;
+            const permErrors = [];
 
             for (const ace of sourceAces) {
               const effect     = ace['jcr:primaryType'] === 'rep:GrantACE' ? 'allow' : 'deny';
@@ -710,9 +711,14 @@
                 if (r.status === 200 || r.status === 201 || r.status === 204) {
                   permOk++;
                 } else {
+                  const detail = await r.text();
+                  permErrors.push(`${principal}: HTTP ${r.status} — ${detail.substring(0, 120)}`);
                   permErr++;
                 }
-              } catch { permErr++; }
+              } catch (e) {
+                permErrors.push(`${principal}: ${e.message}`);
+                permErr++;
+              }
             }
 
             if (permErr === 0) {
@@ -720,9 +726,11 @@
             } else {
               updateLastStep(row, permOk > 0 ? 'pending' : 'err',
                 `${permOk} copied, ${permErr} failed`);
+              row.detail.textContent += '\n\nPermission errors:\n' + permErrors.join('\n');
+              row.detail.style.display = 'block';
             }
           } else {
-            addStepRow(row, 'pending', 'No permissions found on source folder');
+            addStepRow(row, 'pending', 'No explicit ACEs on source folder (permissions inherited from parent)');
           }
 
           setRowBadge(row, 'ok', 'Done');
