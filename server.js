@@ -442,20 +442,50 @@ const server = http.createServer(async (req, res) => {
     // Verify which principals actually exist in AEM before calling modifyAce.
     // Oak's modifyAce returns 422 "invalid payload" for unknown principals.
     async function principalExists(principalId) {
+      // Strategy 1: Granite security search (requires admin; returns 500 for IMS Bearer)
       try {
         const r = await makeReq('GET',
           `/libs/granite/security/search/authorizables.json?type=group&query=${encodeURIComponent(principalId)}&chunk=0&limit=5`,
           { 'Authorization': authHdr, 'Accept': 'application/json' });
-        if (r.status !== 200) return true; // can't verify — attempt anyway
-        const data = JSON.parse(r.body);
-        const items = data.authorizables || data.hits || [];
-        const found = items.some((a) => a.id === principalId || a.name === principalId || a.rep_principalName === principalId);
-        console.log(`[proxy] principal "${principalId}" exists: ${found} (${items.length} results)`);
-        return found;
+        if (r.status === 200) {
+          const data = JSON.parse(r.body);
+          const items = data.authorizables || data.hits || [];
+          const found = items.some((a) => a.id === principalId || a.name === principalId || a.rep_principalName === principalId);
+          console.log(`[proxy] principal check (security): "${principalId}" found=${found}`);
+          return found;
+        }
+        console.log(`[proxy] principal check (security) HTTP ${r.status} — trying QueryBuilder`);
       } catch (e) {
-        console.warn(`[proxy] principal check failed (${e.message}) — will attempt anyway`);
-        return true;
+        console.warn(`[proxy] principal check (security) error: ${e.message}`);
       }
+
+      // Strategy 2: JCR QueryBuilder — works with IMS Bearer tokens if user has /home read access
+      try {
+        const qb = `/bin/querybuilder.json?type=rep:Group&property=rep:principalName&property.value=${encodeURIComponent(principalId)}&p.limit=1`;
+        const r = await makeReq('GET', qb, { 'Authorization': authHdr, 'Accept': 'application/json' });
+        if (r.status === 200) {
+          const data = JSON.parse(r.body);
+          const found = (data.total || 0) > 0;
+          console.log(`[proxy] principal check (querybuilder): "${principalId}" total=${data.total} found=${found}`);
+          return found;
+        }
+        // Also try for users (not just groups)
+        const qu = `/bin/querybuilder.json?type=rep:User&property=rep:principalName&property.value=${encodeURIComponent(principalId)}&p.limit=1`;
+        const ru = await makeReq('GET', qu, { 'Authorization': authHdr, 'Accept': 'application/json' });
+        if (ru.status === 200) {
+          const data = JSON.parse(ru.body);
+          const found = (data.total || 0) > 0;
+          console.log(`[proxy] principal check (querybuilder user): "${principalId}" total=${data.total} found=${found}`);
+          return found;
+        }
+        console.log(`[proxy] principal check (querybuilder) HTTP ${r.status} — cannot verify`);
+      } catch (e) {
+        console.warn(`[proxy] principal check (querybuilder) error: ${e.message}`);
+      }
+
+      // Can't verify — attempt modifyAce anyway; it will fail with 422 if missing
+      console.warn(`[proxy] Cannot verify principal "${principalId}" — attempting modifyAce`);
+      return true;
     }
 
     const results = [];
@@ -521,12 +551,15 @@ const server = http.createServer(async (req, res) => {
       try {
         const r = await makeReq('POST', `${folderPath}.modifyAce.html`, postHeaders, formBody);
         const ok = r.status === 200 || r.status === 201;
-        if (!ok) console.error(`[proxy] modifyAce FAILED HTTP ${r.status}: ${r.body.slice(0, 300)}`);
-        else console.log(`[proxy] modifyAce OK for ${principalId}`);
-        results.push({ principalId, effect, status: r.status, ok });
+        // 422 = "invalid payload" — Oak throws this for unknown principals.
+        const warn = r.status === 422;
+        if (ok)   console.log(`[proxy] modifyAce OK for ${principalId}`);
+        if (!ok)  console.error(`[proxy] modifyAce FAILED HTTP ${r.status} for ${principalId}: ${r.body.slice(0, 200)}`);
+        results.push({ principalId, effect, status: r.status, ok,
+          warn, error: warn ? 'principal not found in AEM user store (422)' : undefined });
       } catch (e) {
         console.error(`[proxy] modifyAce error for ${principalId}: ${e.message}`);
-        results.push({ principalId, effect, status: 502, ok: false, error: e.message });
+        results.push({ principalId, effect, status: 502, ok: false, warn: false, error: e.message });
       }
     }
 

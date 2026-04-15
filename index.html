@@ -712,20 +712,33 @@
                 body: JSON.stringify({ host, token, folderPath: destPath, aces: aceList }),
               });
               const data = await r.json();
-              const results  = data.results || [];
-              const permOk  = results.filter((x) => x.ok).length;
-              const permErr = results.filter((x) => !x.ok).length;
+              const results   = data.results || [];
+              const permOk    = results.filter((x) => x.ok).length;
+              const permWarn  = results.filter((x) => !x.ok && x.warn).length;
+              const permErr   = results.filter((x) => !x.ok && !x.warn).length;
 
-              if (permErr === 0) {
+              if (permErr === 0 && permWarn === 0) {
                 updateLastStep(row, 'ok', `${permOk} principal${permOk !== 1 ? 's' : ''} set`);
               } else {
-                const failList = results.filter((x) => !x.ok)
-                  .map((x) => `${x.principalId}: HTTP ${x.status}`)
+                // Warnings = principal not found in AEM (not a hard failure)
+                // Errors   = network / server issues
+                const warnList = results.filter((x) => !x.ok && x.warn)
+                  .map((x) => `⚠ ${x.principalId}: not found in AEM user store`)
                   .join('\n');
-                updateLastStep(row, permOk > 0 ? 'pending' : 'err',
-                  `${permOk} ok, ${permErr} failed`);
-                row.detail.textContent += '\n\nPermission errors:\n' + failList;
-                row.detail.style.display = 'block';
+                const errList = results.filter((x) => !x.ok && !x.warn)
+                  .map((x) => `✗ ${x.principalId}: HTTP ${x.status} — ${x.error || ''}`)
+                  .join('\n');
+                const severity = permErr > 0 ? 'err' : 'pending';
+                const summary  = [
+                  permOk   > 0 ? `${permOk} set` : '',
+                  permWarn > 0 ? `${permWarn} skipped (principal not in AEM)` : '',
+                  permErr  > 0 ? `${permErr} failed` : '',
+                ].filter(Boolean).join(', ');
+                updateLastStep(row, severity, summary);
+                if (warnList || errList) {
+                  row.detail.textContent += '\n\nPermission details:\n' + [warnList, errList].filter(Boolean).join('\n');
+                  row.detail.style.display = 'block';
+                }
               }
             } catch (e) {
               updateLastStep(row, 'err', `Permission copy error: ${e.message}`);
