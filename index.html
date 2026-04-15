@@ -692,42 +692,43 @@
 
           // ── Step 3: Copy permissions ──
           if (sourceAces.length > 0) {
-            addStepRow(row, 'running', `Copying ${sourceAces.length} permission${sourceAces.length !== 1 ? 's' : ''}…`);
-            let permOk = 0, permErr = 0;
-            const permErrors = [];
+            // Build a flat ACE list to send to the batch endpoint.
+            // Duplicates for the same principal are merged server-side.
+            const aceList = sourceAces
+              .map((ace) => ({
+                principalId: ace['rep:principalName'],
+                privileges:  Array.isArray(ace['rep:privileges']) ? ace['rep:privileges']
+                             : ace['rep:privileges'] ? [ace['rep:privileges']] : [],
+                effect:      ace['jcr:primaryType'] === 'rep:GrantACE' ? 'allow' : 'deny',
+              }))
+              .filter((a) => a.principalId && a.privileges.length > 0);
 
-            for (const ace of sourceAces) {
-              const effect     = ace['jcr:primaryType'] === 'rep:GrantACE' ? 'allow' : 'deny';
-              const principal  = ace['rep:principalName'];
-              const privileges = ace['rep:privileges'] || [];
-              if (!principal || privileges.length === 0) continue;
+            addStepRow(row, 'running', `Copying permissions for ${aceList.length} principal${aceList.length !== 1 ? 's' : ''}…`);
 
-              try {
-                const r = await fetch('/proxy/set-permissions', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ host, token, folderPath: destPath, principalId: principal, privileges, effect }),
-                });
-                if (r.status === 200 || r.status === 201 || r.status === 204) {
-                  permOk++;
-                } else {
-                  const detail = await r.text();
-                  permErrors.push(`${principal}: HTTP ${r.status} — ${detail.substring(0, 120)}`);
-                  permErr++;
-                }
-              } catch (e) {
-                permErrors.push(`${principal}: ${e.message}`);
-                permErr++;
+            try {
+              const r = await fetch('/proxy/apply-aces', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ host, token, folderPath: destPath, aces: aceList }),
+              });
+              const data = await r.json();
+              const results  = data.results || [];
+              const permOk  = results.filter((x) => x.ok).length;
+              const permErr = results.filter((x) => !x.ok).length;
+
+              if (permErr === 0) {
+                updateLastStep(row, 'ok', `${permOk} principal${permOk !== 1 ? 's' : ''} set`);
+              } else {
+                const failList = results.filter((x) => !x.ok)
+                  .map((x) => `${x.principalId}: HTTP ${x.status}`)
+                  .join('\n');
+                updateLastStep(row, permOk > 0 ? 'pending' : 'err',
+                  `${permOk} ok, ${permErr} failed`);
+                row.detail.textContent += '\n\nPermission errors:\n' + failList;
+                row.detail.style.display = 'block';
               }
-            }
-
-            if (permErr === 0) {
-              updateLastStep(row, 'ok', `${permOk} permission${permOk !== 1 ? 's' : ''} copied`);
-            } else {
-              updateLastStep(row, permOk > 0 ? 'pending' : 'err',
-                `${permOk} copied, ${permErr} failed`);
-              row.detail.textContent += '\n\nPermission errors:\n' + permErrors.join('\n');
-              row.detail.style.display = 'block';
+            } catch (e) {
+              updateLastStep(row, 'err', `Permission copy error: ${e.message}`);
             }
           } else {
             addStepRow(row, 'pending', 'No explicit ACEs on source folder (permissions inherited from parent)');

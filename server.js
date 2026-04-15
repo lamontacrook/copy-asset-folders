@@ -375,6 +375,126 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // ── POST /proxy/apply-aces ────────────────────────────────────────────────
+  // Applies a batch of ACEs to a folder in series, waiting for a fresh CSRF
+  // token before each call to avoid the single-use-per-second reuse problem.
+  // Duplicate ACEs for the same principal are merged before applying.
+  if (req.method === 'POST' && req.url === '/proxy/apply-aces') {
+    let payload;
+    try { payload = JSON.parse(await readBody(req)); }
+    catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+
+    const { host, token, folderPath, aces } = payload;
+    if (!host || !token || !folderPath || !Array.isArray(aces))
+      return sendJSON(res, 400, { error: 'Missing required fields: host, token, folderPath, aces' });
+
+    let baseUrl;
+    try { baseUrl = new URL(host); } catch { return sendJSON(res, 400, { error: 'Invalid host URL' }); }
+
+    const isHttps  = baseUrl.protocol === 'https:';
+    const mod      = isHttps ? https : http;
+    const hostname = baseUrl.hostname;
+    const port     = baseUrl.port || (isHttps ? 443 : 80);
+    const authHdr  = `Bearer ${token}`;
+
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+    function makeReq(method, path, headers, body) {
+      return new Promise((resolve, reject) => {
+        const opts = { hostname, port, path, method, headers };
+        console.log(`[proxy] ${method} ${host}${path}`);
+        const r = mod.request(opts, (res2) => {
+          let data = '';
+          res2.on('data', (c) => { data += c; });
+          res2.on('end', () => {
+            console.log(`[proxy]   → HTTP ${res2.statusCode}`);
+            resolve({ status: res2.statusCode, body: data });
+          });
+        });
+        r.on('error', reject);
+        if (body) r.write(body);
+        r.end();
+      });
+    }
+
+    // Merge ACEs by principalId+effect so duplicate entries are combined.
+    const AGGREGATE = {
+      'jcr:all':   ['jcr:read','jcr:write','jcr:readAccessControl','jcr:modifyAccessControl',
+                    'jcr:lockManagement','jcr:versionManagement','jcr:nodeTypeManagement',
+                    'jcr:retentionManagement','jcr:lifecycleManagement','rep:write','crx:replicate'],
+      'jcr:write': ['jcr:modifyProperties','jcr:addChildNodes','jcr:removeNode','jcr:removeChildNodes'],
+      'rep:write': ['jcr:modifyProperties','jcr:addChildNodes','jcr:removeNode',
+                    'jcr:removeChildNodes','jcr:nodeTypeManagement'],
+    };
+
+    const merged = new Map();
+    for (const ace of aces) {
+      const key = `${ace.principalId}||${ace.effect || 'allow'}`;
+      if (!merged.has(key)) merged.set(key, { principalId: ace.principalId, effect: ace.effect || 'allow', privSet: new Set() });
+      for (const p of (ace.privileges || [])) {
+        for (const ep of (AGGREGATE[p] || [p])) merged.get(key).privSet.add(ep);
+      }
+    }
+
+    console.log(`[proxy] apply-aces: ${merged.size} unique principal(s) for ${folderPath}`);
+
+    const results = [];
+    let lastCsrfToken = null;
+
+    for (const { principalId, effect, privSet } of merged.values()) {
+      const expandedPrivileges = [...privSet];
+      if (expandedPrivileges.length === 0) continue;
+
+      // Poll for a fresh CSRF token (different from the last one we used).
+      // AEM issues time-based tokens with 1-second granularity; calling too fast
+      // yields the same token twice. We retry every 200 ms until the token changes.
+      let csrfToken = '';
+      for (let attempt = 0; attempt < 20; attempt++) {
+        if (attempt > 0) await sleep(200);
+        try {
+          const csrfRes = await makeReq('GET', '/libs/granite/csrf/token.json', {
+            'Authorization': authHdr, 'Accept': 'application/json',
+          });
+          csrfToken = (JSON.parse(csrfRes.body).token || '');
+        } catch (e) {
+          console.warn(`[proxy] CSRF fetch error: ${e.message}`);
+        }
+        if (csrfToken && csrfToken !== lastCsrfToken) break;
+        console.log(`[proxy] CSRF token unchanged (attempt ${attempt + 1}), waiting 200 ms…`);
+      }
+      lastCsrfToken = csrfToken;
+      console.log(`[proxy] principal: ${principalId}, effect: ${effect}, privs: ${expandedPrivileges.join(', ')}`);
+      console.log(`[proxy] CSRF token: ${csrfToken ? csrfToken.slice(0, 20) + '…' : '(none)'}`);
+
+      const params = new URLSearchParams();
+      params.append('_charset_', 'utf-8');
+      params.append('principalId', principalId);
+      if (csrfToken) params.append(':cq_csrf_token', csrfToken);
+      for (const priv of expandedPrivileges) params.append(`privilege@${priv}`, effect !== 'deny' ? 'granted' : 'denied');
+      const formBody = params.toString();
+
+      try {
+        const r = await makeReq('POST', `${folderPath}.modifyAce.html`, {
+          'Authorization': authHdr,
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Content-Length': Buffer.byteLength(formBody),
+          'Referer': host,
+        }, formBody);
+
+        const ok = r.status === 200 || r.status === 201;
+        if (!ok) console.error(`[proxy] modifyAce FAILED HTTP ${r.status}: ${r.body.slice(0, 300)}`);
+        results.push({ principalId, effect, status: r.status, ok });
+      } catch (e) {
+        console.error(`[proxy] modifyAce error for ${principalId}: ${e.message}`);
+        results.push({ principalId, effect, status: 502, ok: false, error: e.message });
+      }
+    }
+
+    const allOk = results.every((r) => r.ok);
+    sendJSON(res, allOk ? 200 : 207, { results });
+    return;
+  }
+
   res.writeHead(404);
   res.end('Not found');
 });
