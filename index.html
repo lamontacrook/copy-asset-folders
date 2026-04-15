@@ -673,7 +673,7 @@
                 body: JSON.stringify({ host, token, folderPath: destPath, folderTitle }),
               });
 
-              if (r.status === 200 || r.status === 204) {
+              if (r.status === 200 || r.status === 201 || r.status === 204) {
                 updateLastStep(row, 'ok', `Title set to "${folderTitle}"`);
               } else {
                 updateLastStep(row, 'err', `Title update failed — HTTP ${r.status}`);

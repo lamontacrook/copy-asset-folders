@@ -166,7 +166,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   // ── POST /proxy/update-folder ────────────────────────────────────────────
-  // Updates dc:title (and optionally other properties) on an existing folder.
+  // Updates jcr:title on an existing DAM folder via the Sling POST servlet.
   if (req.method === 'POST' && req.url === '/proxy/update-folder') {
     let payload;
     try { payload = JSON.parse(await readBody(req)); }
@@ -176,18 +176,46 @@ const server = http.createServer(async (req, res) => {
     if (!host || !token || !folderPath || !folderTitle)
       return sendJSON(res, 400, { error: 'Missing required fields: host, token, folderPath, folderTitle' });
 
-    const apiPath = `/api/assets${toApiPath(folderPath)}`;
-    const body = JSON.stringify({
-      class: 'assetFolder',
-      properties: { 'dc:title': folderTitle },
-    });
+    let baseUrl;
+    try { baseUrl = new URL(host); } catch { return sendJSON(res, 400, { error: 'Invalid host URL' }); }
 
-    try {
-      const r = await aemRequest(host, 'PUT', apiPath, token, body);
-      sendJSON(res, r.status, r.body || JSON.stringify({ status: r.status }));
-    } catch (e) {
-      sendJSON(res, 502, { error: e.message });
-    }
+    const isHttps = baseUrl.protocol === 'https:';
+    const mod = isHttps ? https : http;
+
+    // Use the Sling POST servlet on the full JCR path to reliably set node properties.
+    const params = new URLSearchParams();
+    params.append('_charset_', 'utf-8');
+    params.append('jcr:title', folderTitle);
+    params.append('jcr:content/jcr:title', folderTitle);
+    const formBody = params.toString();
+
+    const options = {
+      hostname: baseUrl.hostname,
+      port: baseUrl.port || (isHttps ? 443 : 80),
+      path: folderPath,   // full JCR path, e.g. /content/dam/seat-01
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(formBody),
+      },
+    };
+
+    console.log(`[proxy] POST ${host}${folderPath} (set title: "${folderTitle}")`);
+
+    const r = await new Promise((resolve, reject) => {
+      const req2 = mod.request(options, (res2) => {
+        let data = '';
+        res2.on('data', (c) => { data += c; });
+        res2.on('end', () => resolve({ status: res2.statusCode, body: data }));
+      });
+      req2.on('error', reject);
+      req2.write(formBody);
+      req2.end();
+    }).catch((e) => ({ status: 502, body: JSON.stringify({ error: e.message }) }));
+
+    console.log(`[proxy] Response: HTTP ${r.status}`);
+    sendJSON(res, r.status, r.body || JSON.stringify({ status: r.status }));
     return;
   }
 
