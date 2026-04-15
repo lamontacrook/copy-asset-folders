@@ -320,37 +320,24 @@ const server = http.createServer(async (req, res) => {
       privileges.flatMap((p) => AGGREGATE[p] || [p])
     )];
 
+    // Bearer token auth is inherently CSRF-safe — do not include a CSRF token.
+    // Fetching and reusing a CSRF token across rapid calls causes AEM to reject
+    // subsequent requests with 422 because the token is single-use per second.
+    const isGrant     = effect !== 'deny';
+    const grantOrDeny = isGrant ? 'granted' : 'denied';
+
+    console.log(`[proxy] principal: ${principalId}, effect: ${effect}`);
+    console.log(`[proxy] privileges (expanded): ${expandedPrivileges.join(', ')}`);
+
+    const params = new URLSearchParams();
+    params.append('_charset_', 'utf-8');
+    params.append('principalId', principalId);
+    for (const priv of expandedPrivileges) {
+      params.append(`privilege@${priv}`, grantOrDeny);
+    }
+    const formBody = params.toString();
+
     try {
-      // Step 1: Fetch a CSRF token — required by AEM for mutating POST requests.
-      const csrfRes = await makeRequest('GET', '/libs/granite/csrf/token.json', {
-        'Authorization': authHdr,
-        'Accept': 'application/json',
-      });
-
-      let csrfToken = '';
-      try {
-        const csrfData = JSON.parse(csrfRes.body);
-        csrfToken = csrfData.token || '';
-      } catch { /* non-fatal */ }
-
-      console.log(`[proxy] CSRF token: ${csrfToken ? 'obtained' : 'unavailable'}`);
-      console.log(`[proxy] principal: ${principalId}, effect: ${effect}`);
-      console.log(`[proxy] privileges (expanded): ${expandedPrivileges.join(', ')}`);
-
-      // Step 2: POST to <folderPath>.modifyAce.html
-      const isGrant     = effect !== 'deny';
-      const grantOrDeny = isGrant ? 'granted' : 'denied';
-
-      const params = new URLSearchParams();
-      params.append('_charset_', 'utf-8');
-      params.append('principalId', principalId);
-      if (csrfToken) params.append(':cq_csrf_token', csrfToken);
-      for (const priv of expandedPrivileges) {
-        params.append(`privilege@${priv}`, grantOrDeny);
-      }
-      const formBody = params.toString();
-      console.log(`[proxy] POST body: ${formBody}`);
-
       const aceUrl = `${folderPath}.modifyAce.html`;
       const r = await makeRequest('POST', aceUrl, {
         'Authorization': authHdr,
