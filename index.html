@@ -625,6 +625,14 @@
       const rows = entries.map(({ folderName, folderTitle }) =>
         buildRow(resultsEl, folderName, folderTitle));
 
+      // ── Fetch source permissions once, shared across all folders ──
+      let sourceAces = [];
+      try {
+        sourceAces = await fetchAces(host, token, sourcePath);
+      } catch (e) {
+        // Non-fatal — we'll note it per-row but continue
+      }
+
       let ok = 0, errs = 0;
 
       for (let i = 0; i < entries.length; i++) {
@@ -662,8 +670,8 @@
           errs++;
         }
 
-        // ── Step 2: Set title (only if copy succeeded and title differs from name) ──
         if (copyOk) {
+          // ── Step 2: Set title ──
           if (folderTitle !== folderName) {
             addStepRow(row, 'running', `Setting title to "${folderTitle}"…`);
             try {
@@ -672,7 +680,6 @@
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ host, token, folderPath: destPath, folderTitle }),
               });
-
               if (r.status === 200 || r.status === 201 || r.status === 204) {
                 updateLastStep(row, 'ok', `Title set to "${folderTitle}"`);
               } else {
@@ -681,6 +688,41 @@
             } catch (e) {
               updateLastStep(row, 'err', `Title update error — ${e.message}`);
             }
+          }
+
+          // ── Step 3: Copy permissions ──
+          if (sourceAces.length > 0) {
+            addStepRow(row, 'running', `Copying ${sourceAces.length} permission${sourceAces.length !== 1 ? 's' : ''}…`);
+            let permOk = 0, permErr = 0;
+
+            for (const ace of sourceAces) {
+              const effect     = ace['jcr:primaryType'] === 'rep:GrantACE' ? 'allow' : 'deny';
+              const principal  = ace['rep:principalName'];
+              const privileges = ace['rep:privileges'] || [];
+              if (!principal || privileges.length === 0) continue;
+
+              try {
+                const r = await fetch('/proxy/set-permissions', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ host, token, folderPath: destPath, principalId: principal, privileges, effect }),
+                });
+                if (r.status === 200 || r.status === 201 || r.status === 204) {
+                  permOk++;
+                } else {
+                  permErr++;
+                }
+              } catch { permErr++; }
+            }
+
+            if (permErr === 0) {
+              updateLastStep(row, 'ok', `${permOk} permission${permOk !== 1 ? 's' : ''} copied`);
+            } else {
+              updateLastStep(row, permOk > 0 ? 'pending' : 'err',
+                `${permOk} copied, ${permErr} failed`);
+            }
+          } else {
+            addStepRow(row, 'pending', 'No permissions found on source folder');
           }
 
           setRowBadge(row, 'ok', 'Done');
@@ -836,6 +878,24 @@
     }
 
     // ── Shared API helpers ────────────────────────────────────────────────────
+
+    // Fetches and parses ACEs from a folder's rep:policy node.
+    async function fetchAces(host, token, folderPath) {
+      const res = await fetch('/proxy/get-permissions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ host, token, folderPath }),
+      });
+      if (!res.ok) return [];
+      let data;
+      try { data = await res.json(); } catch { return []; }
+      return Object.values(data).filter(
+        (v) => v && typeof v === 'object' && (
+          v['jcr:primaryType'] === 'rep:GrantACE' ||
+          v['jcr:primaryType'] === 'rep:DenyACE'
+        )
+      );
+    }
 
     // ── DOM helpers ───────────────────────────────────────────────────────────
 
