@@ -266,8 +266,8 @@ const server = http.createServer(async (req, res) => {
   }
 
   // ── POST /proxy/set-permissions ───────────────────────────────────────────
-  // Creates an ACE node directly under the folder's rep:policy node via
-  // the Sling POST servlet. Works on AEM as a Cloud Service without crx/de.
+  // Sets an ACE via the Sling Jackrabbit Access Manager servlet.
+  // Uses .modifyAce.html selector and includes a CSRF token.
   if (req.method === 'POST' && req.url === '/proxy/set-permissions') {
     let payload;
     try { payload = JSON.parse(await readBody(req)); }
@@ -280,51 +280,66 @@ const server = http.createServer(async (req, res) => {
     let baseUrl;
     try { baseUrl = new URL(host); } catch { return sendJSON(res, 400, { error: 'Invalid host URL' }); }
 
-    const isHttps = baseUrl.protocol === 'https:';
-    const mod = isHttps ? https : http;
+    const isHttps  = baseUrl.protocol === 'https:';
+    const mod      = isHttps ? https : http;
+    const hostname = baseUrl.hostname;
+    const port     = baseUrl.port || (isHttps ? 443 : 80);
+    const authHdr  = `Bearer ${token}`;
 
-    const isGrant    = effect !== 'deny';
-    const grantOrDeny = isGrant ? 'granted' : 'denied';
-
-    // Use the Jackrabbit modifyAce Sling operation — posted to the folder path
-    // itself. This calls the Oak Security API properly rather than trying to
-    // manipulate rep:policy nodes directly (which are protected).
-    const params = new URLSearchParams();
-    params.append('_charset_', 'utf-8');
-    params.append(':operation', 'modifyAce');
-    params.append('principalId', principalId);
-    for (const priv of privileges) {
-      params.append(`privilege@${priv}`, grantOrDeny);
+    // Helper: generic HTTP request
+    function makeRequest(method, path, headers, body) {
+      return new Promise((resolve, reject) => {
+        const opts = { hostname, port, path, method, headers };
+        console.log(`[proxy] ${method} ${host}${path}`);
+        const r = mod.request(opts, (res2) => {
+          let data = '';
+          res2.on('data', (c) => { data += c; });
+          res2.on('end', () => {
+            console.log(`[proxy]   → HTTP ${res2.statusCode}`);
+            resolve({ status: res2.statusCode, body: data, headers: res2.headers });
+          });
+        });
+        r.on('error', reject);
+        if (body) r.write(body);
+        r.end();
+      });
     }
-    const formBody = params.toString();
 
-    const options = {
-      hostname: baseUrl.hostname,
-      port: baseUrl.port || (isHttps ? 443 : 80),
-      path: folderPath,   // POST to the folder itself, not rep:policy
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${token}`,
+    try {
+      // Step 1: Fetch a CSRF token — required by AEM for mutating POST requests.
+      const csrfRes = await makeRequest('GET', '/libs/granite/csrf/token.json', {
+        'Authorization': authHdr,
+        'Accept': 'application/json',
+      });
+
+      let csrfToken = '';
+      try {
+        const csrfData = JSON.parse(csrfRes.body);
+        csrfToken = csrfData.token || '';
+      } catch { /* non-fatal — try without token */ }
+
+      console.log(`[proxy] CSRF token: ${csrfToken ? 'obtained' : 'unavailable'}`);
+
+      // Step 2: POST to <folderPath>.modifyAce.html with the ACE parameters.
+      const isGrant     = effect !== 'deny';
+      const grantOrDeny = isGrant ? 'granted' : 'denied';
+
+      const params = new URLSearchParams();
+      params.append('_charset_', 'utf-8');
+      params.append('principalId', principalId);
+      if (csrfToken) params.append(':cq_csrf_token', csrfToken);
+      for (const priv of privileges) {
+        params.append(`privilege@${priv}`, grantOrDeny);
+      }
+      const formBody = params.toString();
+
+      // .modifyAce.html is the registered Sling Jackrabbit Access Manager selector
+      const aceUrl = `${folderPath}.modifyAce.html`;
+      const r = await makeRequest('POST', aceUrl, {
+        'Authorization': authHdr,
         'Content-Type': 'application/x-www-form-urlencoded',
         'Content-Length': Buffer.byteLength(formBody),
-      },
-    };
-
-    console.log(`[proxy] POST ${host}${folderPath} :operation=modifyAce (${principalId} ${grantOrDeny})`);
-
-    const r = await new Promise((resolve, reject) => {
-      const req2 = mod.request(options, (res2) => {
-        let data = '';
-        res2.on('data', (c) => { data += c; });
-        res2.on('end', () => {
-          console.log(`[proxy]   → HTTP ${res2.statusCode}`);
-          resolve({ status: res2.statusCode, body: data });
-        });
-      });
-      req2.on('error', reject);
-      req2.write(formBody);
-      req2.end();
-    }).catch((e) => ({ status: 502, body: JSON.stringify({ error: e.message }) }));
+      }, formBody);
 
     sendJSON(res, r.status, r.body || JSON.stringify({ status: r.status }));
     return;
