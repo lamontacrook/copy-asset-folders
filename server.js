@@ -320,33 +320,52 @@ const server = http.createServer(async (req, res) => {
       privileges.flatMap((p) => AGGREGATE[p] || [p])
     )];
 
-    // Bearer token auth is inherently CSRF-safe — do not include a CSRF token.
-    // Fetching and reusing a CSRF token across rapid calls causes AEM to reject
-    // subsequent requests with 422 because the token is single-use per second.
     const isGrant     = effect !== 'deny';
     const grantOrDeny = isGrant ? 'granted' : 'denied';
 
     console.log(`[proxy] principal: ${principalId}, effect: ${effect}`);
+    console.log(`[proxy] privileges (raw):      ${JSON.stringify(privileges)}`);
     console.log(`[proxy] privileges (expanded): ${expandedPrivileges.join(', ')}`);
-
-    const params = new URLSearchParams();
-    params.append('_charset_', 'utf-8');
-    params.append('principalId', principalId);
-    for (const priv of expandedPrivileges) {
-      params.append(`privilege@${priv}`, grantOrDeny);
-    }
-    const formBody = params.toString();
+    console.log(`[proxy] folderPath: ${folderPath}`);
 
     try {
+      // Fetch a fresh CSRF token per call — AEM CS may require it even with Bearer auth.
+      // Fetching fresh each time avoids the single-use reuse problem from the old approach.
+      let csrfToken = '';
+      try {
+        const csrfRes = await makeRequest('GET', '/libs/granite/csrf/token.json', {
+          'Authorization': authHdr,
+          'Accept': 'application/json',
+        });
+        console.log(`[proxy] CSRF fetch: HTTP ${csrfRes.status}, body: ${csrfRes.body}`);
+        const csrfData = JSON.parse(csrfRes.body);
+        csrfToken = csrfData.token || '';
+      } catch (e) {
+        console.warn(`[proxy] CSRF fetch failed (non-fatal): ${e.message}`);
+      }
+      console.log(`[proxy] CSRF token: ${csrfToken ? csrfToken.slice(0, 20) + '…' : '(none)'}`);
+
+      const params = new URLSearchParams();
+      params.append('_charset_', 'utf-8');
+      params.append('principalId', principalId);
+      if (csrfToken) params.append(':cq_csrf_token', csrfToken);
+      for (const priv of expandedPrivileges) {
+        params.append(`privilege@${priv}`, grantOrDeny);
+      }
+      const formBody = params.toString();
+      console.log(`[proxy] POST body: ${formBody}`);
+
       const aceUrl = `${folderPath}.modifyAce.html`;
       const r = await makeRequest('POST', aceUrl, {
         'Authorization': authHdr,
         'Content-Type': 'application/x-www-form-urlencoded',
         'Content-Length': Buffer.byteLength(formBody),
+        'Referer': host,
       }, formBody);
 
+      console.log(`[proxy] modifyAce response body: ${r.body.slice(0, 500)}`);
       if (r.status !== 200 && r.status !== 201) {
-        console.error(`[proxy] modifyAce failed HTTP ${r.status}:\n${r.body}`);
+        console.error(`[proxy] modifyAce FAILED HTTP ${r.status}`);
       }
       sendJSON(res, r.status, r.body || JSON.stringify({ status: r.status }));
     } catch (e) {
