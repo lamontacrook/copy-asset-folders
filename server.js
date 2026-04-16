@@ -42,7 +42,7 @@ function aemRequest(host, method, apiPath, token, body) {
     if (method === 'COPY' && apiPath._dest) {
       headers['Destination'] = `${host}${apiPath._dest}`;
       headers['X-Destination'] = apiPath._dest;
-      headers['X-Overwrite'] = 'F';
+      headers['X-Overwrite'] = apiPath._overwrite ? 'T' : 'F';
       apiPath = apiPath._src;
     }
 
@@ -149,7 +149,7 @@ const server = http.createServer(async (req, res) => {
     try { payload = JSON.parse(await readBody(req)); }
     catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
 
-    const { host, token, sourcePath, destPath } = payload;
+    const { host, token, sourcePath, destPath, overwrite } = payload;
     if (!host || !token || !sourcePath || !destPath)
       return sendJSON(res, 400, { error: 'Missing required fields: host, token, sourcePath, destPath' });
 
@@ -157,7 +157,7 @@ const server = http.createServer(async (req, res) => {
     const dstApi = `/api/assets${toApiPath(destPath)}`;
 
     try {
-      const r = await aemRequest(host, 'COPY', { _src: srcApi, _dest: dstApi }, token);
+      const r = await aemRequest(host, 'COPY', { _src: srcApi, _dest: dstApi, _overwrite: !!overwrite }, token);
       sendJSON(res, r.status, r.body || JSON.stringify({ status: r.status }));
     } catch (e) {
       sendJSON(res, 502, { error: e.message });

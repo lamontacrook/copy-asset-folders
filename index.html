@@ -409,24 +409,21 @@
 
     <!-- Tabs -->
     <div class="tabs">
-      <div class="tab active" data-tab="create">Copy Folders</div>
+      <div class="tab active" data-tab="create">Sync Folders</div>
       <div class="tab" data-tab="permissions">Permissions</div>
     </div>
 
     <!-- ══════════════════════════════════════════════════════════
-         Tab 1 — Copy Folders
+         Tab 1 — Sync Folders
     ═══════════════════════════════════════════════════════════ -->
     <div class="tab-panel active" id="tab-create">
-
       <p class="section-title">Connection</p>
-
       <div class="field">
         <label for="host">AEM Host</label>
         <input id="host" type="url"
           value="https://author-p186976-e1967129.adobeaemcloud.com"
           placeholder="https://author-p186976-e1967129.adobeaemcloud.com" />
       </div>
-
       <div class="field">
         <label for="token">Bearer Token</label>
         <input id="token" type="password"
@@ -434,35 +431,47 @@
       </div>
 
       <div class="divider"></div>
-      <p class="section-title">Source</p>
-
+      <p class="section-title">Gold Standard</p>
       <div class="field">
-        <label for="sourcePath">Source Folder</label>
-        <input id="sourcePath" type="text"
-          value="/content/dam/seat-00"
-          placeholder="/content/dam/seat-00" />
+        <label for="goldPath">Gold Standard Folder
+          <span class="hint">(source of truth — assets &amp; permissions are copied from here)</span>
+        </label>
+        <input id="goldPath" type="text" value="/content/dam/seat-00" />
       </div>
 
       <div class="divider"></div>
-      <p class="section-title">Destinations</p>
-
+      <p class="section-title">Targets</p>
       <div class="field">
         <label for="parentPath">Parent DAM Path</label>
-        <input id="parentPath" type="text"
-          value="/content/dam"
+        <input id="parentPath" type="text" value="/content/dam"
           placeholder="/content/dam or /content/dam/my-project" />
       </div>
-
       <div class="field">
-        <label for="folderNames">
-          Destinations
+        <label for="folderNames">Target Folders
           <span class="hint">(one per line or comma-separated — use <code style="font-size:0.8em">name | Title</code> to set a display title)</span>
         </label>
-        <textarea id="folderNames" placeholder="seat-01&#10;seat-02 | Seat 02&#10;seat-03 | Seat 03"></textarea>
+        <textarea id="folderNames" placeholder="seat-01&#10;seat-02 | Seat 02&#10;seat-03"></textarea>
+      </div>
+
+      <div class="divider"></div>
+      <p class="section-title">Options</p>
+      <div class="field" style="display:flex;align-items:center;gap:0.6rem">
+        <input id="overwriteExisting" type="checkbox" style="width:auto;padding:0;border:none"
+          checked />
+        <label for="overwriteExisting" style="margin:0;font-weight:400;cursor:pointer">
+          Update existing assets (overwrite assets already present in target)
+        </label>
+      </div>
+      <div class="field" style="display:flex;align-items:center;gap:0.6rem">
+        <input id="syncPerms" type="checkbox" style="width:auto;padding:0;border:none"
+          checked />
+        <label for="syncPerms" style="margin:0;font-weight:400;cursor:pointer">
+          Sync permissions &amp; group memberships
+        </label>
       </div>
 
       <button class="btn btn-primary" id="runBtn" type="button">
-        Copy Folders
+        Sync Folders
       </button>
 
       <div id="results"></div>
@@ -584,18 +593,13 @@
     });
 
     // ════════════════════════════════════════════════════════════
-    // Tab 1 — Copy Folders
+    // Tab 1 — Sync Folders
     // ════════════════════════════════════════════════════════════
 
-    $('runBtn').addEventListener('click', run);
-
-    // Parse "name | title" entries from the textarea (comma or newline separated).
+    // Parse "name | title" entries (comma or newline separated)
     function parseFolderEntries(raw) {
-      return raw
-        .split(/[\n,]+/)
-        .map((s) => s.trim())
-        .filter(Boolean)
-        .map((entry) => {
+      return raw.split(/[\n,]+/).map(s => s.trim()).filter(Boolean)
+        .map(entry => {
           const [name, ...rest] = entry.split('|');
           const folderName  = name.trim();
           const folderTitle = rest.length ? rest.join('|').trim() : folderName;
@@ -603,19 +607,31 @@
         });
     }
 
-    async function run() {
-      const host       = $('host').value.trim().replace(/\/$/, '');
-      const token      = $('token').value.trim();
-      const parentPath = $('parentPath').value.trim().replace(/\/$/, '');
-      const sourcePath = $('sourcePath').value.trim().replace(/\/$/, '');
-      const entries    = parseFolderEntries($('folderNames').value);
+    // Parse AEM Assets HTTP API entity list into [{name, contentType}]
+    function parseAssets(data) {
+      return (data.entities || [])
+        .filter(e => Array.isArray(e.class) && e.class.includes('assets/asset'))
+        .map(e => ({ name: e.properties?.name || '' }))
+        .filter(a => a.name);
+    }
 
-      if (!host || !token || !parentPath || !sourcePath || entries.length === 0) {
-        alert('Please fill in all fields and provide at least one destination folder name.');
+    $('runBtn').addEventListener('click', run);
+
+    async function run() {
+      const host             = $('host').value.trim().replace(/\/$/, '');
+      const token            = $('token').value.trim();
+      const goldPath         = $('goldPath').value.trim().replace(/\/$/, '');
+      const parentPath       = $('parentPath').value.trim().replace(/\/$/, '');
+      const overwriteExist   = $('overwriteExisting').checked;
+      const doPerms          = $('syncPerms').checked;
+      const entries          = parseFolderEntries($('folderNames').value);
+
+      if (!host || !token || !goldPath || !parentPath || entries.length === 0) {
+        alert('Please fill in all fields and provide at least one target folder name.');
         return;
       }
 
-      setBtn('runBtn', true, 'Copying…');
+      setBtn('runBtn', true, 'Syncing…');
       $('summary').style.display = 'none';
 
       const resultsEl = $('results');
@@ -625,27 +641,43 @@
       const rows = entries.map(({ folderName, folderTitle }) =>
         buildRow(resultsEl, folderName, folderTitle));
 
-      // ── Fetch source permissions + MAC group memberships once ──
-      let sourceAces = [];
-      let sourceGroupMembers = {}; // { principalId: { groupPath, members: [...] } }
-      try {
-        sourceAces = await fetchAces(host, token, sourcePath);
-      } catch (e) { /* Non-fatal */ }
-
-      try {
-        const r = await fetch('/proxy/get-group-members', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ host, token, folderPath: sourcePath }),
-        });
-        if (r.ok) {
-          const data = await r.json();
-          sourceGroupMembers = data.groups || {};
-          const total = Object.values(sourceGroupMembers)
-            .reduce((n, g) => n + (g.members || []).length, 0);
-          console.log(`Source group members: ${total} member(s) across ${Object.keys(sourceGroupMembers).length} group(s)`);
+      // ── Step 0: Load gold standard assets once ──────────────────────────
+      let goldAssets = [];
+      {
+        addStepRow(rows[0], 'running', `Loading gold standard: ${goldPath}…`);
+        try {
+          const r = await fetch('/proxy/list-assets', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ host, token, folderPath: goldPath }),
+          });
+          if (r.ok) {
+            goldAssets = parseAssets(await r.json());
+            updateLastStep(rows[0], 'ok', `Gold standard: ${goldAssets.length} asset${goldAssets.length !== 1 ? 's' : ''} found`);
+          } else {
+            updateLastStep(rows[0], 'err', `Could not list gold standard — HTTP ${r.status}`);
+            setBtn('runBtn', false, 'Sync Folders');
+            return;
+          }
+        } catch (e) {
+          updateLastStep(rows[0], 'err', `Gold standard error — ${e.message}`);
+          setBtn('runBtn', false, 'Sync Folders');
+          return;
         }
-      } catch (e) { /* Non-fatal */ }
+      }
+
+      // ── Step 0b: Load source permissions + group members once ────────────
+      let sourceAces = [];
+      let sourceGroupMembers = {};
+      if (doPerms) {
+        try { sourceAces = await fetchAces(host, token, goldPath); } catch {}
+        try {
+          const r = await fetch('/proxy/get-group-members', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ host, token, folderPath: goldPath }),
+          });
+          if (r.ok) sourceGroupMembers = (await r.json()).groups || {};
+        } catch {}
+      }
 
       let ok = 0, errs = 0;
 
@@ -654,177 +686,210 @@
         const row      = rows[i];
         const destPath = `${parentPath}/${folderName}`;
 
-        setRowBadge(row, 'running', 'Copying…');
+        setRowBadge(row, 'running', 'Syncing…');
         row.el.classList.add('open');
 
-        // ── Step 1: Copy folder ──
-        addStepRow(row, 'running', 'Copying folder…');
-        let copyOk = false;
+        // ── Step 1: Inspect target — does it exist? what assets are there? ──
+        addStepRow(row, 'running', `Inspecting ${destPath}…`);
+        let destAssets = null;
         try {
-          const r = await fetch('/proxy/copy-asset', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ host, token, sourcePath, destPath }),
+          const r = await fetch('/proxy/list-assets', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ host, token, folderPath: destPath }),
           });
-
-          if (r.status === 201 || r.status === 200) {
-            updateLastStep(row, 'ok', `Folder copied → ${destPath}`);
-            copyOk = true;
+          if (r.ok) {
+            destAssets = parseAssets(await r.json());
+            updateLastStep(row, 'ok', `Target exists — ${destAssets.length} asset${destAssets.length !== 1 ? 's' : ''} currently`);
+          } else if (r.status === 404 || r.status === 500) {
+            destAssets = null;
+            updateLastStep(row, 'pending', 'Target folder not found — will create from gold standard');
           } else {
-            const msg = await r.text();
-            updateLastStep(row, 'err', `Copy failed — HTTP ${r.status}`);
-            row.detail.textContent = msg;
-            row.detail.style.display = 'block';
-            setRowBadge(row, 'err', 'Failed');
-            errs++;
+            updateLastStep(row, 'err', `Inspect failed — HTTP ${r.status}`);
+            setRowBadge(row, 'err', 'Failed'); errs++; continue;
           }
         } catch (e) {
-          updateLastStep(row, 'err', `Copy error — ${e.message}`);
-          setRowBadge(row, 'err', 'Error');
-          errs++;
+          updateLastStep(row, 'err', `Inspect error — ${e.message}`);
+          setRowBadge(row, 'err', 'Error'); errs++; continue;
         }
 
-        if (copyOk) {
-          // ── Step 2: Set title ──
-          if (folderTitle !== folderName) {
-            addStepRow(row, 'running', `Setting title to "${folderTitle}"…`);
-            try {
-              const r = await fetch('/proxy/update-folder', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ host, token, folderPath: destPath, folderTitle }),
-              });
-              if (r.status === 200 || r.status === 201 || r.status === 204) {
-                updateLastStep(row, 'ok', `Title set to "${folderTitle}"`);
-              } else {
-                updateLastStep(row, 'err', `Title update failed — HTTP ${r.status}`);
-              }
-            } catch (e) {
-              updateLastStep(row, 'err', `Title update error — ${e.message}`);
+        // ── Step 2: Create or sync assets ────────────────────────────────────
+        if (destAssets === null) {
+          // Target doesn't exist — copy entire gold standard folder at once
+          addStepRow(row, 'running', `Creating folder from gold standard…`);
+          try {
+            const r = await fetch('/proxy/copy-asset', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ host, token, sourcePath: goldPath, destPath }),
+            });
+            if (r.status === 201 || r.status === 200) {
+              updateLastStep(row, 'ok', `Folder created with all ${goldAssets.length} asset${goldAssets.length !== 1 ? 's' : ''}`);
+            } else {
+              const msg = await r.text();
+              updateLastStep(row, 'err', `Create failed — HTTP ${r.status}`);
+              row.detail.textContent = msg; row.detail.style.display = 'block';
+              setRowBadge(row, 'err', 'Failed'); errs++; continue;
             }
+          } catch (e) {
+            updateLastStep(row, 'err', `Create error — ${e.message}`);
+            setRowBadge(row, 'err', 'Error'); errs++; continue;
           }
+        } else {
+          // Target exists — sync individual assets
+          const destNames    = new Set(destAssets.map(a => a.name));
+          const missing      = goldAssets.filter(a => !destNames.has(a.name));
+          const toOverwrite  = overwriteExist ? goldAssets.filter(a => destNames.has(a.name)) : [];
+          const toSync       = [
+            ...missing.map(a => ({ ...a, overwrite: false })),
+            ...toOverwrite.map(a => ({ ...a, overwrite: true })),
+          ];
 
-          // ── Step 3: Copy permissions ──
-          if (sourceAces.length > 0) {
-            // Build a flat ACE list to send to the batch endpoint.
-            // Duplicates for the same principal are merged server-side.
-            const aceList = sourceAces
-              .map((ace) => ({
-                principalId: ace['rep:principalName'],
-                privileges:  Array.isArray(ace['rep:privileges']) ? ace['rep:privileges']
-                             : ace['rep:privileges'] ? [ace['rep:privileges']] : [],
-                effect:      ace['jcr:primaryType'] === 'rep:GrantACE' ? 'allow' : 'deny',
-              }))
-              .filter((a) => a.principalId && a.privileges.length > 0);
-
-            addStepRow(row, 'running', `Copying permissions for ${aceList.length} principal${aceList.length !== 1 ? 's' : ''}…`);
-
-            try {
-              const r = await fetch('/proxy/apply-aces', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ host, token, folderPath: destPath, aces: aceList }),
-              });
-              const data = await r.json();
-              const results   = data.results || [];
-              const permOk    = results.filter((x) => x.ok).length;
-              const permWarn  = results.filter((x) => !x.ok && x.warn).length;
-              const permErr   = results.filter((x) => !x.ok && !x.warn).length;
-
-              if (permErr === 0 && permWarn === 0) {
-                updateLastStep(row, 'ok', `${permOk} principal${permOk !== 1 ? 's' : ''} set`);
-              } else {
-                // Warnings = principal not found in AEM (not a hard failure)
-                // Errors   = network / server issues
-                const warnList = results.filter((x) => !x.ok && x.warn)
-                  .map((x) => `⚠ ${x.principalId}: not found in AEM user store`)
-                  .join('\n');
-                const errList = results.filter((x) => !x.ok && !x.warn)
-                  .map((x) => `✗ ${x.principalId}: HTTP ${x.status} — ${x.error || ''}`)
-                  .join('\n');
-                const severity = permErr > 0 ? 'err' : 'pending';
-                const summary  = [
-                  permOk   > 0 ? `${permOk} set` : '',
-                  permWarn > 0 ? `${permWarn} skipped (principal not in AEM)` : '',
-                  permErr  > 0 ? `${permErr} failed` : '',
-                ].filter(Boolean).join(', ');
-                updateLastStep(row, severity, summary);
-                if (warnList || errList) {
-                  row.detail.textContent += '\n\nPermission details:\n' + [warnList, errList].filter(Boolean).join('\n');
-                  row.detail.style.display = 'block';
-                }
-              }
-            } catch (e) {
-              updateLastStep(row, 'err', `Permission copy error: ${e.message}`);
-            }
+          if (toSync.length === 0) {
+            addStepRow(row, 'ok', 'All assets already present — nothing to sync');
           } else {
-            addStepRow(row, 'pending', 'No explicit ACEs on source folder (permissions inherited from parent)');
-          }
+            const label = [
+              missing.length     > 0 ? `${missing.length} missing` : '',
+              toOverwrite.length > 0 ? `${toOverwrite.length} to update` : '',
+            ].filter(Boolean).join(', ');
+            addStepRow(row, 'running', `Syncing ${toSync.length} asset${toSync.length !== 1 ? 's' : ''} (${label})…`);
 
-          // ── Step 4: Copy MAC group memberships ────────────────────────────
-          // AEM Assets "Add Members" stores users as rep:members on the MAC group
-          // node — NOT as ACEs in rep:policy. We copy those memberships here.
-          const groupsWithMembers = Object.entries(sourceGroupMembers)
-            .filter(([, g]) => g.groupPath && g.members && g.members.length > 0);
+            // Progress bar
+            const barWrap  = document.createElement('div'); barWrap.className = 'progress-bar-wrap';
+            const barFill  = document.createElement('div'); barFill.className = 'progress-bar-fill';
+            const barLabel = document.createElement('div'); barLabel.className = 'progress-label';
+            barWrap.appendChild(barFill);
+            row.body.appendChild(barWrap);
+            row.body.appendChild(barLabel);
 
-          if (groupsWithMembers.length > 0) {
-            const totalMembers = groupsWithMembers.reduce((n, [, g]) => n + g.members.length, 0);
-            addStepRow(row, 'running', `Copying ${totalMembers} group member${totalMembers !== 1 ? 's' : ''}…`);
-            let memberOk = 0, memberErr = 0;
-            const memberErrors = [];
+            let assetOk = 0, assetErr = 0;
+            const log = document.createElement('div'); log.className = 'asset-log';
+            row.body.appendChild(log);
 
-            for (const [principalId, { groupPath, members }] of groupsWithMembers) {
+            for (let j = 0; j < toSync.length; j++) {
+              const asset = toSync[j];
+              const srcAsset = `${goldPath}/${asset.name}`;
+              const dstAsset = `${destPath}/${asset.name}`;
+              const logRow   = document.createElement('div'); logRow.className = 'asset-log-row';
+              logRow.textContent = `${asset.overwrite ? '↺' : '+'} ${asset.name}`;
+              log.appendChild(logRow); log.scrollTop = log.scrollHeight;
+
               try {
-                const r = await fetch('/proxy/add-group-members', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ host, token, groupPath, members }),
+                const r = await fetch('/proxy/copy-asset', {
+                  method: 'POST', headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ host, token, sourcePath: srcAsset, destPath: dstAsset, overwrite: asset.overwrite }),
                 });
-                if (r.ok || r.status === 200 || r.status === 201) {
-                  memberOk += members.length;
+                if (r.status === 200 || r.status === 201 || r.status === 204) {
+                  assetOk++;
+                  logRow.textContent += ' ✓';
                 } else {
-                  const detail = await r.text();
-                  memberErrors.push(`${principalId}: HTTP ${r.status} — ${detail.substring(0, 100)}`);
-                  memberErr++;
+                  assetErr++;
+                  logRow.textContent += ` ✗ HTTP ${r.status}`;
+                  logRow.style.color = '#d7373f';
                 }
               } catch (e) {
-                memberErrors.push(`${principalId}: ${e.message}`);
-                memberErr++;
+                assetErr++;
+                logRow.textContent += ` ✗ ${e.message}`;
+                logRow.style.color = '#d7373f';
               }
+
+              const pct = Math.round(((j + 1) / toSync.length) * 100);
+              barFill.style.width = pct + '%';
+              barLabel.textContent = `${j + 1} / ${toSync.length}`;
             }
 
-            if (memberErr === 0) {
-              updateLastStep(row, 'ok', `${memberOk} member${memberOk !== 1 ? 's' : ''} added to groups`);
-            } else {
-              updateLastStep(row, memberOk > 0 ? 'pending' : 'err',
-                `${memberOk} ok, ${memberErr} group(s) failed`);
-              row.detail.textContent += '\n\nGroup member errors:\n' + memberErrors.join('\n');
-              row.detail.style.display = 'block';
-            }
+            updateLastStep(row, assetErr === 0 ? 'ok' : 'pending',
+              `${assetOk} asset${assetOk !== 1 ? 's' : ''} synced${assetErr > 0 ? `, ${assetErr} failed` : ''}`);
           }
-
-          setRowBadge(row, 'ok', 'Done');
-          ok++;
         }
 
+        // ── Step 3: Set folder title ─────────────────────────────────────────
+        if (folderTitle !== folderName) {
+          addStepRow(row, 'running', `Setting title to "${folderTitle}"…`);
+          try {
+            const r = await fetch('/proxy/update-folder', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ host, token, folderPath: destPath, folderTitle }),
+            });
+            updateLastStep(row,
+              (r.status === 200 || r.status === 201 || r.status === 204) ? 'ok' : 'err',
+              (r.status === 200 || r.status === 201 || r.status === 204)
+                ? `Title set to "${folderTitle}"` : `Title update failed — HTTP ${r.status}`);
+          } catch (e) {
+            updateLastStep(row, 'err', `Title error — ${e.message}`);
+          }
+        }
+
+        // ── Step 4: Sync permissions ─────────────────────────────────────────
+        if (doPerms && sourceAces.length > 0) {
+          const aceList = sourceAces
+            .map(ace => ({
+              principalId: ace['rep:principalName'],
+              privileges:  Array.isArray(ace['rep:privileges']) ? ace['rep:privileges']
+                           : ace['rep:privileges'] ? [ace['rep:privileges']] : [],
+              effect:      ace['jcr:primaryType'] === 'rep:GrantACE' ? 'allow' : 'deny',
+            }))
+            .filter(a => a.principalId && a.privileges.length > 0);
+
+          addStepRow(row, 'running', `Syncing permissions for ${aceList.length} principal${aceList.length !== 1 ? 's' : ''}…`);
+          try {
+            const r  = await fetch('/proxy/apply-aces', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ host, token, folderPath: destPath, aces: aceList }),
+            });
+            const d  = await r.json();
+            const rs = d.results || [];
+            const permOk   = rs.filter(x => x.ok).length;
+            const permWarn = rs.filter(x => !x.ok && x.warn).length;
+            const permErr  = rs.filter(x => !x.ok && !x.warn).length;
+            const parts = [
+              permOk   > 0 ? `${permOk} set` : '',
+              permWarn > 0 ? `${permWarn} skipped (principal not in AEM)` : '',
+              permErr  > 0 ? `${permErr} failed` : '',
+            ].filter(Boolean).join(', ');
+            updateLastStep(row, permErr > 0 ? 'err' : permWarn > 0 ? 'pending' : 'ok', parts || 'done');
+          } catch (e) {
+            updateLastStep(row, 'err', `Permission sync error: ${e.message}`);
+          }
+        }
+
+        // ── Step 5: Sync group memberships ───────────────────────────────────
+        if (doPerms) {
+          const groupsWithMembers = Object.entries(sourceGroupMembers)
+            .filter(([, g]) => g.groupPath && g.members && g.members.length > 0);
+          if (groupsWithMembers.length > 0) {
+            const totalM = groupsWithMembers.reduce((n, [, g]) => n + g.members.length, 0);
+            addStepRow(row, 'running', `Syncing ${totalM} group member${totalM !== 1 ? 's' : ''}…`);
+            let mOk = 0, mErr = 0;
+            for (const [, { groupPath, members }] of groupsWithMembers) {
+              try {
+                const r = await fetch('/proxy/add-group-members', {
+                  method: 'POST', headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ host, token, groupPath, members }),
+                });
+                if (r.ok || r.status === 200 || r.status === 201) mOk += members.length;
+                else mErr++;
+              } catch { mErr++; }
+            }
+            updateLastStep(row, mErr === 0 ? 'ok' : 'pending',
+              `${mOk} member${mOk !== 1 ? 's' : ''} synced${mErr > 0 ? `, ${mErr} group(s) failed` : ''}`);
+          }
+        }
+
+        setRowBadge(row, 'ok', 'Done');
         row.el.classList.remove('open');
+        ok++;
       }
 
-      const total = folderNames.length;
+      const total = entries.length;
       const s = $('summary');
       s.style.display = 'block';
-      if (errs === 0) {
-        s.className = 'ok';
-        s.textContent = `Done — ${ok} folder${ok !== 1 ? 's' : ''} copied successfully.`;
-      } else if (ok > 0) {
-        s.className = 'partial';
-        s.textContent = `Completed with issues — ${ok}/${total} folders copied, ${errs} failed.`;
-      } else {
-        s.className = 'err';
-        s.textContent = `All ${total} folder copies failed.`;
-      }
+      s.className = errs === 0 ? 'ok' : ok > 0 ? 'partial' : 'err';
+      s.textContent = errs === 0
+        ? `Done — ${ok} folder${ok !== 1 ? 's' : ''} synced to gold standard.`
+        : ok > 0
+          ? `Completed with issues — ${ok}/${total} folders synced, ${errs} failed.`
+          : `All ${total} sync operations failed.`;
 
-      setBtn('runBtn', false, 'Copy Folders');
+      setBtn('runBtn', false, 'Sync Folders');
     }
 
     // ════════════════════════════════════════════════════════════
@@ -999,6 +1064,7 @@
       return {
         el,
         badge:    el.querySelector('.badge'),
+        body:     el.querySelector('.folder-row-body'),
         stepList: el.querySelector('.step-list'),
         detail:   el.querySelector('.step-detail'),
       };
